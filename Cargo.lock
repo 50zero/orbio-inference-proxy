@@ -2543,7 +2543,7 @@ dependencies = [
  "hpke",
  "log",
  "pin-project",
- "rand 0.10.2",
+ "rand 0.10.4",
  "serde",
  "serde_derive",
  "sha2 0.11.0",
@@ -2956,7 +2956,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.2",
  "lru-slab",
- "rand 0.10.2",
+ "rand 0.10.4",
  "rand_pcg",
  "ring",
  "rustc-hash",
@@ -3016,9 +3016,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.2"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+checksum = "8f6fa277c67e6ea590466f04c3fe82cb509f0864fe470643e5570de9514a9b11"
 dependencies = [
  "chacha20 0.10.2",
  "getrandom 0.4.2",
@@ -4289,7 +4289,7 @@ dependencies = [
  "nv-attestation-sdk",
  "ohttp",
  "percent-encoding",
- "rand 0.10.2",
+ "rand 0.10.4",
  "redis",
  "regex",
  "reqwest",
