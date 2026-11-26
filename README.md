@@ -7,7 +7,7 @@ Fork of [nearai/inference-proxy](https://github.com/nearai/inference-proxy) at c
 Deployment target:
 
 - Phala Cloud GPU TEE, 4x NVIDIA B300 (Blackwell), dstack OS v0.6.5, Intel TDX
-- SGLang at `http://sglang:30000` (OpenAI-compatible, no API key on the internal network)
+- SGLang at `http://sglang:30000` (OpenAI-compatible, no API key on the internal network). DeepSeek V4.1 parsers: `--reasoning-parser deepseek-v41` and `--tool-call-parser deepseekv41`
 - Model id `orbio/deepseek-v4.1-flash-uncensored`
 - Public URL `https://gpu.orbiocompute.com` — dstack-ingress terminates TLS inside the CVM, Caddy allowlists, this proxy listens on `:8000`
 - Prompts and completions are not logged and are not written to disk
@@ -71,6 +71,25 @@ Pin the image by digest after the first GHCR publish (`sha-<shortsha>` and `late
 
 ```yaml
 services:
+  sglang:
+    # Pin the SGLang image by digest in the real compose. DeepSeek V4.1
+    # parsers are deepseek-v41 / deepseekv41. Served id matches MODEL_NAME.
+    command:
+      - python3
+      - -m
+      - sglang.launch_server
+      - --model-path
+      - orbio/deepseek-v4.1-flash-uncensored
+      - --served-model-name
+      - orbio/deepseek-v4.1-flash-uncensored
+      - --host
+      - 0.0.0.0
+      - --port
+      - "30000"
+      - --reasoning-parser
+      - deepseek-v41
+      - --tool-call-parser
+      - deepseekv41
   inference-proxy:
     image: ghcr.io/50zero/orbio-inference-proxy@sha256:<digest>
     user: "65532:65532"
