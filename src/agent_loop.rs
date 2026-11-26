@@ -281,7 +281,11 @@ pub async fn run_chat_completion(
                     return;
                 };
                 let response_sha256 = hex::encode(result.hasher.finalize());
-                let text = format!("{model_name}:{request_hash}:{response_sha256}");
+                let text = crate::proxy::provider_tee_signed_text(
+                    &model_name,
+                    &request_hash,
+                    &response_sha256,
+                );
                 match signing.sign_chat(&text) {
                     Ok(signed) => match serde_json::to_string(&signed) {
                         Ok(signed_json) => {

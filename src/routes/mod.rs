@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod catalog;
 pub mod chat;
 mod completion_placement;
 pub mod completions;
@@ -23,6 +24,7 @@ pub const ROUTE_HEALTHZ: &str = "/healthz";
 pub const ROUTE_METRICS: &str = "/metrics";
 pub const ROUTE_V1_METRICS: &str = "/v1/metrics";
 pub const ROUTE_V1_MODELS: &str = "/v1/models";
+pub const ROUTE_V1_MODEL_LIST: &str = "/v1/model/list";
 pub const ROUTE_ATTESTATION_REPORT: &str = "/v1/attestation/report";
 pub const ROUTE_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 pub const ROUTE_COMPLETIONS: &str = "/v1/completions";
@@ -244,7 +246,8 @@ pub fn build_model_list_router() -> Router<AppState> {
             ROUTE_METRICS,
             get(crate::metrics_middleware::prometheus_metrics_handler),
         )
-        .route(ROUTE_V1_MODELS, get(metrics::models));
+        .route(ROUTE_V1_MODELS, get(metrics::models))
+        .route(ROUTE_V1_MODEL_LIST, get(catalog::model_list));
     with_post_routes(router, true).fallback(unknown_route)
 }
 
@@ -262,6 +265,7 @@ pub fn build_router() -> Router<AppState> {
         // Unauthenticated backend metrics/models
         .route(ROUTE_V1_METRICS, get(metrics::metrics))
         .route(ROUTE_V1_MODELS, get(metrics::models))
+        .route(ROUTE_V1_MODEL_LIST, get(catalog::model_list))
         // Unauthenticated attestation report
         .route(
             ROUTE_ATTESTATION_REPORT,

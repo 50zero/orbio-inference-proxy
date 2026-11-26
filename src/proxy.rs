@@ -782,6 +782,30 @@ pub(crate) fn prepare_direct_usage(
     )))
 }
 
+/// Signed-text canonical form: `<model>:<sha256 hex of request body>:<sha256 hex of response body>`.
+/// The digests are of the exact bytes received and the exact bytes sent.
+pub(crate) fn provider_tee_signed_text(
+    model: &str,
+    request_sha256: &str,
+    response_sha256: &str,
+) -> String {
+    format!("{model}:{request_sha256}:{response_sha256}")
+}
+
+/// Chat completions always carry `inference-id`. When usage reporting did
+/// not already set one, this is a fresh UUIDv4.
+pub(crate) fn ensure_chat_inference_id(mut response: Response) -> Response {
+    if response.headers().get("inference-id").is_none() {
+        let id = uuid::Uuid::new_v4();
+        response.headers_mut().insert(
+            "inference-id",
+            axum::http::HeaderValue::from_str(&id.to_string())
+                .expect("UUID contains only header-safe ASCII"),
+        );
+    }
+    response
+}
+
 pub(crate) fn add_direct_inference_id(response: &mut Response, inference_id: Option<uuid::Uuid>) {
     if let Some(inference_id) = inference_id {
         response.headers_mut().insert(
@@ -2172,7 +2196,7 @@ async fn proxy_json_request_inner(
     let response_sha256 = hex::encode(Sha256::digest(final_body.as_bytes()));
 
     // Sign and cache
-    let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
+    let text = provider_tee_signed_text(&opts.model_name, &request_sha256, &response_sha256);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
         error!(error_kind = "signing", "Signing failed");
         AppError::Internal(e)
@@ -3346,7 +3370,7 @@ async fn proxy_streaming_request_inner(
         if completed_cleanly {
             let response_sha256 = hex::encode(hasher.finalize());
             if let Some(ref id) = parser.chat_id {
-                let text = format!("{model_name}:{request_sha256}:{response_sha256}");
+                let text = provider_tee_signed_text(&model_name, &request_sha256, &response_sha256);
                 let signature_cached = match signing.sign_chat(&text) {
                     Ok(signed) => match serde_json::to_string(&signed) {
                         Ok(signed_json) => {
@@ -3765,7 +3789,7 @@ async fn proxy_multipart_request_inner(
     let response_sha256 = hex::encode(Sha256::digest(final_body.as_bytes()));
 
     // Sign and cache
-    let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
+    let text = provider_tee_signed_text(&opts.model_name, request_sha256, &response_sha256);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
         error!(error_kind = "signing", "Signing failed");
         AppError::Internal(e)
@@ -3930,7 +3954,7 @@ pub(crate) async fn sign_and_cache_json_response(
     let response_sha256 = hex::encode(Sha256::digest(final_body.as_bytes()));
 
     // Sign and cache
-    let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
+    let text = provider_tee_signed_text(&opts.model_name, request_sha256, &response_sha256);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
         error!(error_kind = "signing", "Signing failed");
         AppError::Internal(e)
@@ -7039,5 +7063,21 @@ data: [DONE]
         assert!(pool
             .select_with_preference_bounded(None, 0, &policy)
             .is_none());
+    }
+
+    #[test]
+    fn provider_tee_text_is_model_request_sha_response_sha() {
+        let request = b"{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+        let response = b"{\"id\":\"chatcmpl-1\"}";
+        let req = hex::encode(Sha256::digest(request));
+        let resp = hex::encode(Sha256::digest(response));
+        let text = provider_tee_signed_text("orbio/deepseek-v4.1-flash-uncensored", &req, &resp);
+        assert_eq!(
+            text,
+            format!("orbio/deepseek-v4.1-flash-uncensored:{req}:{resp}")
+        );
+        assert_eq!(req.len(), 64);
+        assert_eq!(resp.len(), 64);
+        assert!(!text.contains("hi"));
     }
 }

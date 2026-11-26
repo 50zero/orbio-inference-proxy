@@ -98,6 +98,11 @@ async fn serve(
 
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    if let Some(ref ctx) = enc_ctx {
+        // 421 before decryption or any generation when the gateway pinned
+        // a different model key.
+        encryption::require_model_pub_key(&headers, ctx, &state.signing)?;
+    }
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
 
     // Request hash for signing: SHA256(wire body) by default. X-Request-Hash is only
@@ -266,7 +271,8 @@ async fn serve(
             chunk_transform,
             count,
         )
-        .await;
+        .await
+        .map(proxy::ensure_chat_inference_id);
     }
 
     // For cloud API key requests with streaming, force include_usage AND
@@ -379,9 +385,13 @@ async fn serve(
     };
 
     if is_stream {
-        proxy::proxy_streaming_request(model.backend_client, &placed.url, modified_body, opts).await
+        proxy::proxy_streaming_request(model.backend_client, &placed.url, modified_body, opts)
+            .await
+            .map(proxy::ensure_chat_inference_id)
     } else {
-        proxy::proxy_json_request(model.backend_client, &placed.url, modified_body, opts).await
+        proxy::proxy_json_request(model.backend_client, &placed.url, modified_body, opts)
+            .await
+            .map(proxy::ensure_chat_inference_id)
     }
 }
 

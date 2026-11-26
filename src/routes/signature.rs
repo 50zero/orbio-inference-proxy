@@ -50,13 +50,17 @@ pub async fn signature(
         }
     };
 
-    Ok(Json(
-        serde_json::to_value(SignatureResponse {
+    // JSON via axum, no compression layer. `text` is the cached string
+    // over the exact request and response bytes; this handler does not
+    // re-encode those bodies.
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        Json(SignatureResponse {
             text: signed.text,
             signature,
             signing_address,
             signing_algo: signing_algo.to_string(),
-        })
-        .unwrap(),
+            signature_kind: "provider_tee".to_string(),
+        }),
     ))
 }

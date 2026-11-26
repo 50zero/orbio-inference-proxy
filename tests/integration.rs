@@ -3589,7 +3589,7 @@ async fn test_attestation_signing_address_mismatch() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = body_to_json(response).await;
     assert!(body["error"]["message"]
         .as_str()

@@ -35,6 +35,9 @@ pub struct AttestationResponse {
     #[serde(flatten)]
     pub report: AttestationReport,
     pub all_attestations: Vec<AttestationReport>,
+    /// NEAR public cloud-api shape: the same node report(s) nested for
+    /// verifiers that read `model_attestations[]` instead of the flat fields.
+    pub model_attestations: Vec<AttestationReport>,
     /// Compose-manager deployment attestation, if available.
     /// Contains the compose-manager's TDX-attested action log (deployment events).
     ///
@@ -66,9 +69,11 @@ impl AttestationResponse {
         ohttp_attestation: Option<OhttpAttestation>,
     ) -> Self {
         let ohttp_key_config = ohttp_attestation.as_ref().map(|att| att.key_config.clone());
+        let model_attestations = all_attestations.clone();
         Self {
             report,
             all_attestations,
+            model_attestations,
             compose_manager_attestation,
             ohttp_key_config,
             ohttp_attestation,
@@ -97,4 +102,7 @@ pub struct SignatureResponse {
     pub signature: String,
     pub signing_address: String,
     pub signing_algo: String,
+    /// NEAR cloud-api discriminator. This proxy is the model TEE, so the
+    /// value is always `provider_tee`.
+    pub signature_kind: String,
 }

@@ -1,12 +1,10 @@
 name: Build & Deploy
 
+# Upstream published to Docker Hub. This fork publishes
+# ghcr.io/50zero/orbio-inference-proxy from image.yml. Manual only, so a
+# push to main does not require NEAR registry secrets.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    tags:
-      - "v*"
 
 env:
   REGISTRY: docker.io

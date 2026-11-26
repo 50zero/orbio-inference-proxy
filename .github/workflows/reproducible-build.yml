@@ -33,17 +33,10 @@ name: Reproducible Build
 #
 # build-image.sh builds with --no-cache in a builder of its own, so no build
 # reuses another's layers.
+# Manual on this fork. image.yml publishes the GHCR image; this workflow
+# still rebuilds the bit-reproducible archive and is not required for every
+# push (it compared digests against NEAR's Docker Hub publish).
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-    # No path filter, on purpose: build-image.sh bakes the commit hash into the
-    # image (/etc/.GIT_REV), so every push that build.yml publishes is a new
-    # digest and needs the verifier-parity check, not only pushes that touch
-    # the build inputs. Keep this trigger aligned with build.yml's.
-  schedule:
-    # Mondays 03:00 UTC, on main.
-    - cron: "0 3 * * 1"
   workflow_dispatch:
 
 permissions:

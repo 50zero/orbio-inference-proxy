@@ -399,4 +399,14 @@ COPY --chmod=664 .GIT_REV /etc/
 ENV LISTEN_PORT=8000
 EXPOSE 8000
 
+# Non-root. Port 8000 does not need cap_net_bind_service. NVML device nodes
+# and /var/run/dstack.sock are mounted at runtime and must be readable by
+# uid 65532; the NVIDIA container runtime's `count: all` reservation does
+# that without privileged. A static passwd/group append avoids useradd's
+# timestamped shadow files.
+RUN printf 'proxy:x:65532:\n' >> /etc/group \
+    && printf 'proxy:x:65532:65532:proxy:/nonexistent:/usr/sbin/nologin\n' >> /etc/passwd \
+    && chown -R 65532:65532 /app
+USER 65532:65532
+
 ENTRYPOINT ["/app/vllm-proxy-rs"]

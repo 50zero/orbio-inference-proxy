@@ -81,6 +81,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Load config
     let mut config = config::Config::from_env()?;
+    let gpu_arch = attestation::configured_gpu_arch().map_err(anyhow::Error::msg)?;
+    let gpu_count = attestation::configured_gpu_count().map_err(anyhow::Error::msg)?;
+    info!(%gpu_arch, gpu_count, "GPU attestation target");
     // Decided once, before anything is built on it: a usage queue that fails
     // its startup check leaves the process on the HTTP transport when that is
     // configured, and refuses startup when it is not.

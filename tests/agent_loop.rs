@@ -563,8 +563,15 @@ async fn happy_path_executes_search_and_continues() {
             .and_then(|v| v.to_str().ok()),
         Some("text/event-stream")
     );
-    // Trusted config-token callers are not billed here: no billing header.
-    assert!(response.headers().get("inference-id").is_none());
+    // Chat completions always carry inference-id. Without a usage reporter
+    // it is a UUIDv4, not the billing v5 id.
+    let inference_id = response
+        .headers()
+        .get("inference-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("inference-id");
+    let parsed = uuid::Uuid::parse_str(inference_id).unwrap();
+    assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
     let body = body_to_string(response).await;
 
     // Sanity: tool-call chunks from iteration 1, our synthetic tool-result

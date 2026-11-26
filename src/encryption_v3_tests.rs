@@ -438,7 +438,12 @@ fn v3_removes_completion_metadata_from_json_and_sse() {
                     &response["choices"][0][key],
                 ] {
                     for (field, expected) in metadata.as_object().unwrap() {
-                        if version == 3 {
+                        // v3 always drops engine extensions. v2 with the
+                        // all-fields flag (this context is built as v3, then
+                        // the version byte is overwritten) does the same on
+                        // buffered JSON so a text chat cannot carry plaintext
+                        // side fields. Streaming v2 is unchanged.
+                        if version == 3 || (version == 2 && !stream) {
                             assert!(object.get(field).is_none(), "{endpoint:?}: {field}");
                         } else {
                             assert_eq!(&object[field], expected);

@@ -63,6 +63,7 @@ impl LinePolicy {
                 | ROUTE_METRICS
                 | ROUTE_V1_METRICS
                 | ROUTE_V1_MODELS
+                | ROUTE_V1_MODEL_LIST
                 | ROUTE_OHTTP_WELL_KNOWN
                 | ROUTE_OHTTP_CONFIG,
             ) => Self::Silent,

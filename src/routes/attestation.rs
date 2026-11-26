@@ -16,7 +16,22 @@ pub struct AttestationQuery {
     pub signing_address: Option<String>,
     /// Include TLS certificate fingerprint in the report data.
     /// Defaults to false; when true, report_data[..32] = SHA256(signing_address || cert_fingerprint).
+    /// `false` (the Orbio gateway) binds report_data as pubkey || nonce.
     pub include_tls_fingerprint: Option<bool>,
+    /// Canonical model id. When present it must equal this instance's
+    /// `MODEL_NAME` (no aliasing). Omitted: this instance's model.
+    pub model: Option<String>,
+    /// Accepted so NEAR-shaped verifiers can send `provider`. Not used
+    /// to select a backend; this process serves one model.
+    pub provider: Option<String>,
+}
+
+fn normalize_hex_address(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_ascii_lowercase()
 }
 
 /// GET /v1/attestation/report
@@ -30,6 +45,22 @@ pub async fn attestation_report(
                 .to_string(),
         ));
     }
+    // `x-no-aliasing` and `Authorization` are accepted and not required.
+    // A model query that is not this instance is rejected rather than rewritten.
+    let _provider = query.provider.as_deref();
+    if let Some(model) = query.model.as_deref() {
+        if model.is_empty() {
+            return Err(AppError::BadRequest(
+                "model must be this instance's model name".to_string(),
+            ));
+        }
+        if model != state.config.model_name {
+            return Err(AppError::NotFound(
+                "The requested model is not served by this instance".to_string(),
+            ));
+        }
+    }
+
     let signing_algo = query.signing_algo.as_deref().unwrap_or("ecdsa");
 
     if signing_algo != "ecdsa" && signing_algo != "ed25519" {
@@ -52,12 +83,11 @@ pub async fn attestation_report(
         _ => unreachable!(),
     };
 
-    // If signing_address is specified and doesn't match, return 404
+    // A signing address for a different key is 503 with the exact
+    // NEAR text `Signing address not found` (checked before any quote).
     if let Some(requested_addr) = &query.signing_address {
-        if signing_address.to_lowercase() != requested_addr.to_lowercase() {
-            return Err(AppError::NotFound(
-                "Signing address not found on this server".to_string(),
-            ));
+        if normalize_hex_address(&signing_address) != normalize_hex_address(requested_addr) {
+            return Err(AppError::SigningAddressNotFound);
         }
     }
 

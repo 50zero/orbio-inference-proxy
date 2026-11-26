@@ -769,12 +769,60 @@ print(json.dumps(evidence))
     Ok(evidence)
 }
 
-/// Build NVIDIA payload JSON.
-fn build_nvidia_payload(nonce_hex: &str, evidences: &serde_json::Value) -> String {
+/// `GPU_ARCH` for the NRAS `/v3/attest/gpu` body. Default `BLACKWELL`
+/// (Orbio 4x B300). `HOPPER` remains accepted. Anything else is an error
+/// so a typo cannot ship evidence under the wrong architecture label.
+pub fn parse_gpu_arch(raw: &str) -> Result<String, String> {
+    let arch = raw.trim().to_ascii_uppercase();
+    match arch.as_str() {
+        "BLACKWELL" | "HOPPER" => Ok(arch),
+        _ => {
+            let shown = if raw.trim().len() > 32 {
+                "<invalid>"
+            } else {
+                raw.trim()
+            };
+            Err(format!(
+                "GPU_ARCH must be BLACKWELL or HOPPER (got {shown})"
+            ))
+        }
+    }
+}
+
+pub fn configured_gpu_arch() -> Result<String, String> {
+    match std::env::var("GPU_ARCH") {
+        Ok(raw) => parse_gpu_arch(&raw),
+        Err(_) => Ok("BLACKWELL".to_string()),
+    }
+}
+
+/// How many per-GPU evidence entries a real collection must contain.
+/// Unset means 4 (the Orbio box). `GPU_COUNT=0` disables the check
+/// (dev hosts). A non-integer is an error.
+pub fn parse_gpu_count(raw: Option<&str>) -> Result<usize, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(4),
+        Some(s) => s.parse::<usize>().map_err(|_| {
+            let shown = if s.len() > 16 { "<invalid>" } else { s };
+            format!("GPU_COUNT must be an integer (got {shown})")
+        }),
+    }
+}
+
+pub fn configured_gpu_count() -> Result<usize, String> {
+    parse_gpu_count(std::env::var("GPU_COUNT").ok().as_deref())
+}
+
+/// Build the NVIDIA NRAS `/v3/attest/gpu` JSON body.
+///
+/// Shape is `{nonce, evidence_list, arch}` and is forwarded unchanged.
+/// `nonce` is the client nonce (lowercase hex). `evidence_list` is every
+/// GPU the collector returned. `arch` is `GPU_ARCH`.
+fn build_nvidia_payload(nonce_hex: &str, evidences: &serde_json::Value, arch: &str) -> String {
     serde_json::json!({
         "nonce": nonce_hex,
         "evidence_list": evidences,
-        "arch": "HOPPER",
+        "arch": arch,
     })
     .to_string()
 }
@@ -1069,30 +1117,36 @@ const GPU_EVIDENCE_NONCE_MAX_ATTEMPTS: usize = 4;
 /// giving the firmware time to settle if the cause is contention.
 const GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS: u64 = 100;
 
-/// SPDM-style request opcode header at the start of every per-GPU
-/// attestation report binary, observed across PASS and FAIL responses
-/// captured from production.
+/// Hopper production captures start with this SPDM 1.1 GET_MEASUREMENTS
+/// request header. Blackwell uses the same DMTF layout (4-byte header,
+/// then the 32-byte nonce) but may bump the SPDM minor version byte.
+#[cfg_attr(not(test), allow(dead_code))]
 const GPU_EVIDENCE_HEADER: [u8; 4] = [0x11, 0xE0, 0x01, 0xFF];
 
-/// Byte range where the per-GPU attestation report binary embeds the
-/// caller-provided nonce. Verified against captured production responses
-/// (working glm-5 capture and a tampered-evidence FAIL capture both have
-/// the request nonce at offset 4..36 of the base64-decoded `evidence`
-/// field).
+/// SPDM GET_MEASUREMENTS request code (DSP0274).
+const SPDM_GET_MEASUREMENTS: u8 = 0xE0;
+
 const GPU_EVIDENCE_NONCE_OFFSET: usize = 4;
 const GPU_EVIDENCE_NONCE_LEN: usize = 32;
 
-/// Decode a single per-GPU `evidence` (base64) and check that the
-/// 32-byte slice at offset 4..36 equals the caller's nonce.
+/// True when `bytes` is an SPDM GET_MEASUREMENTS request (version 1.0–1.4).
+/// The nonce is then at offset 4, independent of Param1/Param2, for both
+/// Hopper (`0x11`) and later Blackwell drivers (`0x12`/`0x13`).
+fn is_spdm_get_measurements_request(bytes: &[u8]) -> bool {
+    bytes.len() >= GPU_EVIDENCE_NONCE_OFFSET + GPU_EVIDENCE_NONCE_LEN
+        && (0x10..=0x14).contains(&bytes[0])
+        && bytes[1] == SPDM_GET_MEASUREMENTS
+}
+
+/// Decode one per-GPU `evidence` blob and require it to be bound to
+/// `expected_nonce`.
 ///
-/// Returns `false` if the field is missing, not base64, too short, or
-/// the nonce doesn't match (NRAS rejects all of these as
-/// `NONCE_NOT_MATCHING`/`INVALID_EVIDENCE_*`).
-///
-/// Returns `true` (fail-open) when the evidence has an SPDM header we
-/// don't recognise. Verification is best-effort — if NVIDIA bumps the
-/// request opcode in a future driver, we'd rather let NRAS render
-/// judgment than reject every PASS evidence in our fleet.
+/// * SPDM GET_MEASUREMENTS (Hopper and Blackwell): the 32 bytes at offset
+///   4 must equal the nonce. A copy elsewhere does not rescue a wrong
+///   binding slot — NRAS reports `NONCE_NOT_MATCHING` for that case.
+/// * Any other layout: fail closed unless the raw nonce (or its hex
+///   encoding) occurs in the blob. Returning evidence whose nonce we
+///   cannot find would let a firmware race ship another request's report.
 fn evidence_has_correct_nonce(
     evidence_entry: &serde_json::Value,
     expected_nonce: &[u8; 32],
@@ -1107,12 +1161,21 @@ fn evidence_has_correct_nonce(
     if bytes.len() < GPU_EVIDENCE_NONCE_OFFSET + GPU_EVIDENCE_NONCE_LEN {
         return false;
     }
-    if bytes[..GPU_EVIDENCE_HEADER.len()] != GPU_EVIDENCE_HEADER {
-        // Unknown SPDM revision — fail open (see doc comment above).
+    if is_spdm_get_measurements_request(&bytes) {
+        return bytes
+            [GPU_EVIDENCE_NONCE_OFFSET..GPU_EVIDENCE_NONCE_OFFSET + GPU_EVIDENCE_NONCE_LEN]
+            == expected_nonce[..];
+    }
+    if bytes
+        .windows(GPU_EVIDENCE_NONCE_LEN)
+        .any(|w| w == expected_nonce)
+    {
         return true;
     }
-    bytes[GPU_EVIDENCE_NONCE_OFFSET..GPU_EVIDENCE_NONCE_OFFSET + GPU_EVIDENCE_NONCE_LEN]
-        == expected_nonce[..]
+    let hex_lower = hex::encode(expected_nonce);
+    let hex_upper = hex_lower.to_ascii_uppercase();
+    let text = String::from_utf8_lossy(&bytes);
+    text.contains(&hex_lower) || text.contains(&hex_upper)
 }
 
 /// Why a per-GPU nonce binding check failed.
@@ -1237,7 +1300,18 @@ pub(crate) async fn collect_gpu_evidence_with_nonce_check(
         }
 
         match check_evidence_nonce_binding(&evidence, nonce_bytes) {
-            Ok(()) => return Ok(evidence),
+            Ok(()) => {
+                let expected = configured_gpu_count().map_err(|e| anyhow::anyhow!(e))?;
+                if expected != 0 {
+                    let n = evidence.as_array().map(|a| a.len()).unwrap_or(0);
+                    if n != expected {
+                        anyhow::bail!(
+                            "GPU evidence list has {n} entries, expected {expected} (GPU_COUNT). Refusing to return a partial GPU attestation"
+                        );
+                    }
+                }
+                return Ok(evidence);
+            }
             Err(reason) => {
                 metrics::counter!("gpu_evidence_nonce_mismatch_total").increment(1);
                 warn!(
@@ -1319,7 +1393,9 @@ async fn generate_attestation_inner(
 
     let event_log: serde_json::Value = serde_json::from_str(&quote_result.event_log)
         .map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?;
-    let nvidia_payload = build_nvidia_payload(&nonce_hex, &gpu_evidence);
+    let gpu_arch = configured_gpu_arch()
+        .map_err(|e| AttestationError::Internal(anyhow::anyhow!("invalid GPU_ARCH: {e}")))?;
+    let nvidia_payload = build_nvidia_payload(&nonce_hex, &gpu_evidence, &gpu_arch);
 
     // dstack info is static — use cached value if available.
     let info_value = if let Some(cache) = cache {
@@ -1526,12 +1602,39 @@ mod tests {
         let nonce = "abc123";
         let evidence = serde_json::json!([{"gpu": "H100"}]);
 
-        let payload_str = build_nvidia_payload(nonce, &evidence);
+        let payload_str = build_nvidia_payload(nonce, &evidence, "BLACKWELL");
         let payload: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
 
         assert_eq!(payload["nonce"], "abc123");
-        assert_eq!(payload["arch"], "HOPPER");
+        assert_eq!(payload["arch"], "BLACKWELL");
         assert_eq!(payload["evidence_list"][0]["gpu"], "H100");
+        assert!(payload.get("claims_version").is_none());
+
+        let hopper = build_nvidia_payload(nonce, &evidence, "HOPPER");
+        let hopper: serde_json::Value = serde_json::from_str(&hopper).unwrap();
+        assert_eq!(hopper["arch"], "HOPPER");
+    }
+
+    #[test]
+    fn gpu_arch_defaults_to_blackwell_and_rejects_unknown() {
+        assert_eq!(parse_gpu_arch("blackwell").unwrap(), "BLACKWELL");
+        assert_eq!(parse_gpu_arch("HOPPER").unwrap(), "HOPPER");
+        assert!(parse_gpu_arch("ADA").is_err());
+        assert_eq!(parse_gpu_count(None).unwrap(), 4);
+        assert_eq!(parse_gpu_count(Some("0")).unwrap(), 0);
+        assert!(parse_gpu_count(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn ed25519_report_data_is_pubkey_then_nonce() {
+        // include_tls_fingerprint=false: report_data is exactly
+        // ed25519_pubkey (32) || client nonce (32). No hash, no padding.
+        let pubkey = vec![0xABu8; 32];
+        let nonce = [0x11u8; 32];
+        let data = build_report_data(&pubkey, &nonce, None);
+        assert_eq!(data.len(), 64);
+        assert_eq!(&data[..32], pubkey.as_slice());
+        assert_eq!(&data[32..], &nonce);
     }
 
     /// Build a synthetic per-GPU evidence binary in the format observed in
@@ -1588,21 +1691,72 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn evidence_has_correct_nonce_passes_unknown_header_through() {
-        // If NVIDIA changes the SPDM opcode header in a future driver,
-        // we don't want to fail-closed and reject every PASS evidence.
-        // The check returns true ("can't verify, assume ok") and lets
-        // NRAS make the call.
-        let nonce = [0xABu8; 32];
+    fn b64_bytes(bytes: &[u8]) -> String {
         use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn evidence_has_correct_nonce_rejects_unknown_header_without_nonce() {
+        // Unknown layout and the nonce is not in the blob: fail closed.
+        // The previous Hopper check returned true here (fail open).
+        let nonce = [0xABu8; 32];
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&[0x99, 0x88, 0x77, 0x66]); // unknown header
-        bytes.extend_from_slice(&[0u8; 32]); // not the expected nonce
+        bytes.extend_from_slice(&[0x99, 0x88, 0x77, 0x66]);
+        bytes.extend_from_slice(&[0u8; 32]);
         bytes.extend_from_slice(&[0u8; 28]);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert!(!evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": b64_bytes(&bytes)}),
+            &nonce
+        ));
+    }
+
+    #[test]
+    fn evidence_nonce_accepts_blackwell_spdm_version_at_offset_4() {
+        // SPDM 1.2 and 1.3 GET_MEASUREMENTS: same nonce slot as Hopper 1.1.
+        let nonce = [0xABu8; 32];
+        for version in [0x12u8, 0x13] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&[version, 0xE0, 0x01, 0xFF]);
+            bytes.extend_from_slice(&nonce);
+            bytes.extend_from_slice(&[0u8; 16]);
+            assert!(
+                evidence_has_correct_nonce(
+                    &serde_json::json!({"evidence": b64_bytes(&bytes)}),
+                    &nonce
+                ),
+                "version {version:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_nonce_rejects_wrong_binding_slot_even_if_nonce_appears_later() {
+        let request_nonce = [0xABu8; 32];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x12, 0xE0, 0x01, 0xFF]);
+        bytes.extend_from_slice(&[0xCDu8; 32]); // wrong slot
+        bytes.extend_from_slice(&request_nonce); // decoy
+        assert!(!evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": b64_bytes(&bytes)}),
+            &request_nonce
+        ));
+    }
+
+    #[test]
+    fn evidence_nonce_unknown_layout_accepts_embedded_raw_or_hex_nonce() {
+        let nonce = [0xABu8; 32];
+        let mut raw = vec![0x00u8; 8];
+        raw.extend_from_slice(&nonce);
+        raw.extend_from_slice(&[0x01; 4]);
         assert!(evidence_has_correct_nonce(
-            &serde_json::json!({"evidence": b64}),
+            &serde_json::json!({"evidence": b64_bytes(&raw)}),
+            &nonce
+        ));
+
+        let hex_ascii = hex::encode(nonce).into_bytes();
+        assert!(evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": b64_bytes(&hex_ascii)}),
             &nonce
         ));
     }
@@ -1842,6 +1996,11 @@ mod tests {
             serde_json::from_slice(&bytes.unwrap()).expect("cached bytes should be valid JSON");
         assert_eq!(parsed["request_nonce"], "aabb");
         assert!(parsed["all_attestations"].is_array());
+        assert_eq!(parsed["model_attestations"][0]["request_nonce"], "aabb");
+        assert_eq!(
+            parsed["model_name"],
+            parsed["model_attestations"][0]["model_name"]
+        );
     }
 
     #[tokio::test]

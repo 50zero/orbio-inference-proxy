@@ -77,6 +77,17 @@ pub enum AppError {
     #[error("model not found")]
     ModelNotFound { model: Option<String> },
 
+    /// Requested `signing_address` is not this instance. The HTTP body
+    /// contains the exact text `Signing address not found` (status 503).
+    #[error("Signing address not found")]
+    SigningAddressNotFound,
+
+    /// `X-Model-Pub-Key` was present and is not this instance's key.
+    /// Returned before any token is generated. The message does not echo
+    /// the header value.
+    #[error("model public key does not match this instance")]
+    ModelKeyMismatch,
+
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -194,6 +205,32 @@ impl IntoResponse for AppError {
                     }
                 });
                 return (*status, axum::Json(body)).into_response();
+            }
+            AppError::SigningAddressNotFound => {
+                metrics::counter!("http_errors_total", "error_type" => "signing_address_not_found")
+                    .increment(1);
+                let body = serde_json::json!({
+                    "error": {
+                        "message": "Signing address not found",
+                        "type": "signing_address_not_found",
+                        "param": null,
+                        "code": null,
+                    }
+                });
+                return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+            }
+            AppError::ModelKeyMismatch => {
+                metrics::counter!("http_errors_total", "error_type" => "model_key_mismatch")
+                    .increment(1);
+                let body = serde_json::json!({
+                    "error": {
+                        "message": "X-Model-Pub-Key does not match this instance",
+                        "type": "model_key_mismatch",
+                        "param": "X-Model-Pub-Key",
+                        "code": null,
+                    }
+                });
+                return (StatusCode::MISDIRECTED_REQUEST, axum::Json(body)).into_response();
             }
             AppError::ModelNotFound { model } => {
                 // OpenAI's answer for a model the caller cannot use, `code`

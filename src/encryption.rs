@@ -170,6 +170,37 @@ pub fn extract_encryption_context(
     }
 }
 
+/// `X-Model-Pub-Key`, when present, must be this instance's public key for
+/// the request's signing algorithm. A mismatch is HTTP 421 and is checked
+/// before decryption or generation. The header value is not logged.
+/// Absent header: accepted (plaintext and older clients).
+pub fn require_model_pub_key(
+    headers: &axum::http::HeaderMap,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    let Some(raw) = headers.get("x-model-pub-key") else {
+        return Ok(());
+    };
+    let Ok(presented) = raw.to_str() else {
+        return Err(AppError::ModelKeyMismatch);
+    };
+    let expected = match ctx.algo {
+        EncryptionAlgo::Ed25519 => signing.ed25519.signing_public_key.as_str(),
+        EncryptionAlgo::Ecdsa => signing.ecdsa.signing_public_key.as_str(),
+    };
+    let normalize = |s: &str| {
+        s.trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .to_ascii_lowercase()
+    };
+    if normalize(presented) != normalize(expected) {
+        return Err(AppError::ModelKeyMismatch);
+    }
+    Ok(())
+}
+
 // ── Ed25519 / NaCl Box encryption ───────────────────────────────────
 
 mod nacl {
@@ -655,7 +686,11 @@ pub fn encrypt_response_fields(
     if sanitize_encrypted_error(value) {
         return Ok(());
     }
-    if ctx.version == 3 && matches!(endpoint, Endpoint::ChatCompletions | Endpoint::Completions) {
+    // v3 always, and v2 with X-Encrypt-All-Fields: drop engine extensions
+    // so a buffered chat message cannot carry plaintext side fields.
+    if (ctx.version == 3 || (ctx.version == 2 && ctx.encrypt_all_fields))
+        && matches!(endpoint, Endpoint::ChatCompletions | Endpoint::Completions)
+    {
         retain_completion_fields(value, endpoint, false);
     }
     match endpoint {
@@ -1197,9 +1232,39 @@ fn encrypt_chat_response_choices(
                     encrypt_logprobs_tokens(logprobs, ctx, signing)?;
                 }
             }
+            if !is_streaming && ctx.version == 2 && ctx.encrypt_all_fields {
+                if let Some(msg) = choice.get_mut(msg_key) {
+                    drop_empty_message_fields(msg);
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Drop null, empty-string, and empty-container message fields other than
+/// `role` so a buffered v2 response's only non-empty message fields are the
+/// encrypted text fields (and non-empty tool calls, when the client used tools).
+fn drop_empty_message_fields(msg: &mut serde_json::Value) {
+    let Some(obj) = msg.as_object_mut() else {
+        return;
+    };
+    let keys: Vec<String> = obj.keys().cloned().collect();
+    for key in keys {
+        if key == "role" {
+            continue;
+        }
+        let remove = match obj.get(&key) {
+            Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(s)) if s.is_empty() => true,
+            Some(serde_json::Value::Array(items)) if items.is_empty() => true,
+            Some(serde_json::Value::Object(map)) if map.is_empty() => true,
+            _ => false,
+        };
+        if remove {
+            obj.remove(&key);
+        }
+    }
 }
 
 /// Encrypt token strings and byte arrays inside logprobs (both `content` and `refusal` arrays).
@@ -1468,6 +1533,131 @@ mod tests {
         let encrypted = nacl::encrypt(plaintext, &server_x25519_pub).unwrap();
         let decrypted = nacl::decrypt(&encrypted, &server_x25519_secret).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn v2_buffered_chat_keeps_usage_and_encrypts_nonempty_text_only() {
+        let signing = test_signing_pair();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: signing.ed25519.signing_address_bytes.clone(),
+            version: 2,
+            encrypt_all_fields: true,
+        };
+        let mut body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "hello",
+                    "reasoning": "think",
+                    "reasoning_content": "",
+                    "refusal": null,
+                    "matched_stop": "secret-stop"
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": 2}
+            }
+        });
+        encrypt_response_fields(&mut body, Endpoint::ChatCompletions, &ctx, &signing).unwrap();
+        assert_eq!(body["choices"].as_array().unwrap().len(), 1);
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["id"], "chatcmpl-1");
+        let msg = &body["choices"][0]["message"];
+        assert_eq!(msg["role"], "assistant");
+        assert_ne!(msg["content"], "hello");
+        assert_ne!(msg["reasoning"], "think");
+        assert!(msg.get("reasoning_content").is_none());
+        assert!(msg.get("refusal").is_none());
+        assert!(msg.get("matched_stop").is_none());
+        assert_eq!(body["usage"]["prompt_tokens"], 3);
+        assert_eq!(body["usage"]["completion_tokens"], 1);
+        assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+        let content = msg["content"].as_str().unwrap();
+        assert!(content.chars().all(|c| c.is_ascii_hexdigit()));
+        let raw = hex::decode(content).unwrap();
+        assert!(raw.len() > 32 + 24 + 16);
+    }
+
+    #[test]
+    fn v2_independent_python_vector_round_trip() {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/e2ee_v2.json")).unwrap();
+        let secret = hex::decode(vector["recipient_ed25519_seed"].as_str().unwrap()).unwrap();
+        let secret: [u8; 32] = secret.try_into().unwrap();
+        let x_secret = nacl::ed25519_secret_to_x25519(&secret);
+        let wire = hex::decode(vector["ciphertext_hex"].as_str().unwrap()).unwrap();
+        let plain = nacl_v2::decrypt(&wire, &x_secret).unwrap();
+        assert_eq!(plain, vector["plaintext"].as_str().unwrap().as_bytes());
+
+        // The symmetric key python derived must match this process.
+        let eph_sk = hex::decode(vector["ephemeral_x25519_secret"].as_str().unwrap()).unwrap();
+        let eph_sk: [u8; 32] = eph_sk.try_into().unwrap();
+        let eph = x25519_dalek::StaticSecret::from(eph_sk);
+        let recipient_x = nacl::ed25519_public_to_x25519(
+            &hex::decode(vector["recipient_ed25519_public"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let shared = eph.diffie_hellman(&x25519_dalek::PublicKey::from(recipient_x));
+        let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, shared.as_bytes());
+        let mut key = [0u8; 32];
+        hkdf.expand(b"ed25519_encryption", &mut key).unwrap();
+        assert_eq!(
+            hex::encode(key),
+            vector["symmetric_key_hex"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn model_pub_key_mismatch_is_421_and_does_not_echo_the_header() {
+        let signing = test_signing_pair();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: signing.ed25519.signing_address_bytes.clone(),
+            version: 2,
+            encrypt_all_fields: true,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        let wrong = "11".repeat(32);
+        headers.insert("x-model-pub-key", wrong.parse().unwrap());
+        let err = require_model_pub_key(&headers, &ctx, &signing).unwrap_err();
+        let response = axum::response::IntoResponse::into_response(err);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::MISDIRECTED_REQUEST
+        );
+        // The wrong key must not be copied into the error type's Display.
+        assert!(!err_display_contains_key());
+        let _ = wrong;
+
+        headers.insert(
+            "x-model-pub-key",
+            signing.ed25519.signing_public_key.parse().unwrap(),
+        );
+        assert!(require_model_pub_key(&headers, &ctx, &signing).is_ok());
+    }
+
+    fn err_display_contains_key() -> bool {
+        let signing = test_signing_pair();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: signing.ed25519.signing_address_bytes.clone(),
+            version: 2,
+            encrypt_all_fields: true,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        let wrong = "22".repeat(32);
+        headers.insert("x-model-pub-key", wrong.parse().unwrap());
+        let err = require_model_pub_key(&headers, &ctx, &signing).unwrap_err();
+        err.to_string().contains(&wrong)
     }
 
     #[test]
