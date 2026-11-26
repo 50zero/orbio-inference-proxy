@@ -1,0 +1,48 @@
+[advisories]
+version = 2
+ignore = [
+    # pin-utils is unmaintained (informational, not a vulnerability). It comes in only
+    # through aws-smithy-http 0.63 / aws-smithy-types 1.5 (via aws-sigv4 and
+    # aws-credential-types). Their releases without pin-utils (aws-sigv4 1.5+) need
+    # Rust 1.94.1, and the reproducible Dockerfile pins Rust 1.93.0. Drop this entry
+    # when the toolchain moves to 1.94.1 and the AWS crates are updated.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained pin-utils via aws-smithy; fix needs Rust 1.94.1 (Dockerfile pins 1.93.0)" },
+    { id = "RUSTSEC-2026-0543", reason = "transitive Chrono dependency in the event envelope" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+private = { ignore = true }
+
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    # NVIDIA's attestation SDK Rust bindings (libnvat FFI). Not yet on
+    # crates.io; pinned to release tag 2026.04.29 in Cargo.toml. Optional
+    # `nv-attestation-sdk` feature only — default builds don't pull this.
+    "https://github.com/NVIDIA/attestation-sdk.git",
+    # Usage envelope and payload shared with the SQS consumer (`usage_report`).
+    "https://github.com/nearai/cloud-platform-events",
+]

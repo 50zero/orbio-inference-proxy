@@ -1,0 +1,1608 @@
+use super::*;
+
+/// The built-in defaults: no per-model variable is set.
+fn defaults() -> ModelDefaults {
+    ModelDefaults {
+        admission_queue_saturated_at: 1,
+        reasoning_off_effort: "none".to_string(),
+        ..Default::default()
+    }
+}
+
+fn process() -> ProcessSettings {
+    ProcessSettings {
+        admission_ramp_step: 8,
+        admission_ramp_interval_secs: 1800,
+        admission_backpressure_secs: 10,
+        admission_retry_after_secs: 2,
+        bills_usage: true,
+    }
+}
+
+fn lookup(name: &str) -> Option<String> {
+    match name {
+        "VLLM_BACKEND_TOKEN_ALPHA" => Some("alpha-secret".to_string()),
+        "VLLM_BACKEND_TOKEN_BETA" => Some(" beta-secret ".to_string()),
+        "VLLM_BACKEND_TOKEN_BLANK" => Some("  ".to_string()),
+        _ => None,
+    }
+}
+
+fn parse_with(
+    list: serde_json::Value,
+    defaults: &ModelDefaults,
+    process: &ProcessSettings,
+) -> anyhow::Result<Vec<ModelConfig>> {
+    parse(&list.to_string(), defaults, process, &lookup).map(|list| list.models)
+}
+
+fn parse_list(list: serde_json::Value) -> anyhow::Result<Vec<ModelConfig>> {
+    parse_with(list, &defaults(), &process())
+}
+
+fn error_of(list: serde_json::Value) -> String {
+    parse_list(list)
+        .expect_err("the list must be refused")
+        .to_string()
+}
+
+/// The three-model list of `docs/gateway-mode.md`, read from the document
+/// itself so the example operators copy is one this code accepts.
+fn documented_list() -> serde_json::Value {
+    let doc = include_str!("../docs/gateway-mode.md");
+    let (_, after) = doc
+        .split_once("Three models, one with a long-context tier and two plain ones:")
+        .expect("the example's lead-in");
+    let (_, after) = after.split_once("```json\n").expect("the example");
+    let (example, _) = after.split_once("```").expect("the example's end");
+    serde_json::from_str(example).expect("the example is JSON")
+}
+
+#[test]
+fn the_documented_list_resolves_to_three_models() {
+    let models = parse_list(documented_list()).unwrap();
+    assert_eq!(models.len(), 3);
+
+    let alpha = &models[0];
+    assert_eq!(alpha.id, "example/alpha");
+    assert_eq!(alpha.backend_urls.len(), 3);
+    assert_eq!(alpha.backend_probe_urls.len(), 3);
+    assert_eq!(
+        alpha.backend_long_context_urls,
+        ["https://alpha-long-b4.inference.example"]
+    );
+    assert_eq!(
+        alpha.pool_probe_urls().last().unwrap(),
+        "http://alpha-4.internal.example:8000"
+    );
+    assert_eq!(alpha.long_context_above_tokens, 100_000);
+    assert!(alpha.backend_tier_strict);
+    assert!(alpha.admission_tier_borrowing);
+    assert_eq!(alpha.admission_long_max_inflight_per_host, 12);
+    assert_eq!(alpha.admission_long_reserved_inflight, 12);
+    assert_eq!(alpha.admission_max_inflight, 48);
+    assert_eq!(alpha.admission_start_inflight, 48);
+    assert_eq!(alpha.admission_queue_saturated_at, 4);
+    assert_eq!(alpha.capacity_requests_per_minute, 150);
+    assert_eq!(alpha.discount_to_user, Some(0.3));
+    assert_eq!(alpha.reasoning_off_effort, "low");
+    assert_eq!(alpha.backend_token.as_deref(), Some("alpha-secret"));
+    assert_eq!(alpha.backend_priority, Some(-1));
+
+    // A plain model: its own budget and token, everything else the built-in
+    // defaults, and no tier at all.
+    let beta = &models[1];
+    assert_eq!(beta.admission_max_inflight, 16);
+    assert_eq!(beta.admission_start_inflight, 16);
+    assert_eq!(beta.admission_queue_saturated_at, 1);
+    assert_eq!(beta.backend_token.as_deref(), Some("beta-secret"));
+    assert!(beta.backend_long_context_urls.is_empty());
+    assert_eq!(beta.long_context_above_tokens, 0);
+    assert!(!beta.backend_tier_strict);
+    assert_eq!(beta.discount_to_user, None);
+    assert_eq!(beta.reasoning_off_effort, "none");
+
+    // `id` and `backend_urls` alone are a model.
+    let gamma = &models[2];
+    assert_eq!(gamma.backend_urls, ["https://gamma-b1.inference.example"]);
+    assert_eq!(gamma.admission_max_inflight, 0);
+    assert_eq!(gamma.backend_token, None);
+    assert_eq!(gamma.backend_priority, None);
+}
+
+#[test]
+fn omitted_keys_fall_back_to_the_process_level_values() {
+    let defaults = ModelDefaults {
+        long_context_above_tokens: 100_000,
+        backend_tier_strict: true,
+        admission_max_inflight: 48,
+        admission_start_inflight: Some(24),
+        admission_queue_saturated_at: 4,
+        affinity_hold_at_limit: false,
+        admission_tier_borrowing: true,
+        admission_long_max_inflight_per_host: 12,
+        admission_long_reserved_inflight: 8,
+        capacity_requests_per_minute: 150,
+        discount_to_user: Some(0.2),
+        reasoning_off_effort: "low".to_string(),
+        backend_token: Some("shared-secret".to_string()),
+        backend_priority: Some(-1),
+    };
+    let models = parse_with(
+        serde_json::json!({"models": [
+            {
+                "id": "tiered",
+                "backend_urls": ["https://a.example"],
+                "long_context": {"backend_urls": ["https://a-long.example"]}
+            },
+            {"id": "plain", "backend_urls": ["https://b.example"]},
+            {
+                "id": "own",
+                "backend_urls": ["https://c.example"],
+                "admission_max_inflight": 0,
+                "admission_queue_saturated_at": 2,
+                "capacity_requests_per_minute": 0,
+                "discount_to_user": 0,
+                "reasoning_off_effort": "none",
+                "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
+                "backend_priority": 5
+            }
+        ]}),
+        &defaults,
+        &process(),
+    )
+    .unwrap();
+
+    let tiered = &models[0];
+    assert_eq!(tiered.long_context_above_tokens, 100_000);
+    assert!(tiered.backend_tier_strict);
+    assert!(tiered.admission_tier_borrowing);
+    assert_eq!(tiered.admission_long_max_inflight_per_host, 12);
+    assert_eq!(tiered.admission_long_reserved_inflight, 8);
+    assert_eq!(tiered.admission_max_inflight, 48);
+    assert_eq!(tiered.admission_start_inflight, 24);
+    assert_eq!(tiered.admission_queue_saturated_at, 4);
+    assert_eq!(tiered.capacity_requests_per_minute, 150);
+    assert_eq!(tiered.discount_to_user, Some(0.2));
+    assert_eq!(tiered.reasoning_off_effort, "low");
+    assert_eq!(tiered.backend_token.as_deref(), Some("shared-secret"));
+    assert_eq!(tiered.backend_priority, Some(-1));
+
+    // The tier variables are defaults for a tier, not a tier: a model
+    // without `long_context` has none, whatever they say.
+    let plain = &models[1];
+    assert_eq!(plain.long_context_above_tokens, 0);
+    assert!(!plain.backend_tier_strict);
+    assert!(!plain.admission_tier_borrowing);
+    assert_eq!(plain.admission_long_max_inflight_per_host, 0);
+    assert_eq!(plain.admission_long_reserved_inflight, 0);
+    assert_eq!(plain.admission_max_inflight, 48);
+    assert_eq!(plain.discount_to_user, Some(0.2));
+
+    // An entry's own value wins, including the ones that switch a default off.
+    let own = &models[2];
+    assert_eq!(own.admission_max_inflight, 0);
+    assert_eq!(own.admission_queue_saturated_at, 2);
+    assert_eq!(own.capacity_requests_per_minute, 0);
+    assert_eq!(own.discount_to_user, None);
+    assert_eq!(own.reasoning_off_effort, "none");
+    assert_eq!(own.backend_token.as_deref(), Some("alpha-secret"));
+    assert_eq!(own.backend_priority, Some(5));
+}
+
+#[test]
+fn start_inflight_is_the_entrys_then_the_variable_then_the_models_own_maximum() {
+    let start_of = |entry: serde_json::Value, variable: Option<u32>| {
+        let defaults = ModelDefaults {
+            admission_max_inflight: 48,
+            admission_start_inflight: variable,
+            ..defaults()
+        };
+        parse_with(
+            serde_json::json!({"models": [entry]}),
+            &defaults,
+            &process(),
+        )
+        .map(|models| models[0].admission_start_inflight)
+    };
+    let entry = |extra: serde_json::Value| {
+        let mut entry = serde_json::json!({"id": "m", "backend_urls": ["https://a.example"]});
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        entry
+    };
+    assert_eq!(start_of(entry(serde_json::json!({})), None).unwrap(), 48);
+    assert_eq!(
+        start_of(entry(serde_json::json!({})), Some(24)).unwrap(),
+        24
+    );
+    assert_eq!(
+        start_of(
+            entry(serde_json::json!({"admission_max_inflight": 16})),
+            None
+        )
+        .unwrap(),
+        16
+    );
+    assert_eq!(
+        start_of(
+            entry(serde_json::json!({"admission_start_inflight": 8})),
+            Some(24)
+        )
+        .unwrap(),
+        8
+    );
+    // A smaller budget under a larger process-level start is not clamped
+    // silently: the entry has to say where it starts.
+    let error = start_of(
+        entry(serde_json::json!({"admission_max_inflight": 16})),
+        Some(24),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("model \"m\"") && error.contains("VLLM_PROXY_ADMISSION_START_INFLIGHT"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_backend_token_is_read_from_the_named_variable_and_never_printed() {
+    let models = parse_list(documented_list()).unwrap();
+    let printed = format!("{models:?}");
+    assert!(!printed.contains("alpha-secret"), "{printed}");
+    assert!(!printed.contains("beta-secret"), "{printed}");
+    assert!(
+        printed.contains("backend_token: Some(\"<set>\")"),
+        "{printed}"
+    );
+    assert!(printed.contains("backend_token: None"), "{printed}");
+}
+
+fn one(extra: serde_json::Value) -> serde_json::Value {
+    let mut entry = serde_json::json!({"id": "m", "backend_urls": ["https://a.example"]});
+    entry
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    serde_json::json!({"models": [entry]})
+}
+
+fn tiered(tier: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    let mut long_context = serde_json::json!({
+        "backend_urls": ["https://a-long.example"],
+        "above_tokens": 100000
+    });
+    long_context
+        .as_object_mut()
+        .unwrap()
+        .extend(tier.as_object().unwrap().clone());
+    let mut extra = extra;
+    extra["long_context"] = long_context;
+    one(extra)
+}
+
+#[test]
+fn a_list_that_is_not_a_model_list_is_refused() {
+    for (text, expected) in [
+        ("", "not a valid model list"),
+        ("[]", "not a valid model list"),
+        ("{}", "missing field `models`"),
+        ("{\"models\": {}}", "not a valid model list"),
+        (
+            "{\"models\": [{\"backend_urls\": [\"https://a.example\"]}]}",
+            "missing field `id`",
+        ),
+        (
+            "{\"models\": [{\"id\": \"m\"}]}",
+            "missing field `backend_urls`",
+        ),
+        (
+            "{\"models\": [], \"defaults\": {}}",
+            "unknown field `defaults`",
+        ),
+    ] {
+        let error = parse(text, &defaults(), &process(), &lookup)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{text}: {error}");
+    }
+    assert!(error_of(serde_json::json!({"models": []})).contains("`models` is empty"));
+}
+
+#[test]
+fn a_mistyped_key_is_refused_rather_than_defaulted() {
+    let error = error_of(one(serde_json::json!({"admission_max_inflght": 48})));
+    assert!(
+        error.contains("unknown field `admission_max_inflght`"),
+        "{error}"
+    );
+    let error = error_of(tiered(
+        serde_json::json!({"above_token": 1}),
+        serde_json::json!({}),
+    ));
+    assert!(error.contains("unknown field `above_token`"), "{error}");
+    // The file holds the name of the token's variable, never a token.
+    let error = error_of(one(serde_json::json!({"backend_token": "secret"})));
+    assert!(error.contains("unknown field `backend_token`"), "{error}");
+}
+
+#[test]
+fn ids_must_be_exact_and_unique() {
+    for id in ["", " m", "m ", "m\n"] {
+        let error = error_of(serde_json::json!({"models": [
+            {"id": id, "backend_urls": ["https://a.example"]}
+        ]}));
+        assert!(
+            error.contains("exact cloud-api model name"),
+            "{id:?}: {error}"
+        );
+    }
+    let error = error_of(serde_json::json!({"models": [
+        {"id": "m", "backend_urls": ["https://a.example"]},
+        {"id": "m", "backend_urls": ["https://b.example"]}
+    ]}));
+    assert!(
+        error.contains("model \"m\" is listed more than once"),
+        "{error}"
+    );
+    // Ids are compared byte for byte, so these are two models.
+    parse_list(serde_json::json!({"models": [
+        {"id": "org/m", "backend_urls": ["https://a.example"]},
+        {"id": "org/M", "backend_urls": ["https://b.example"]}
+    ]}))
+    .unwrap();
+}
+
+/// `one({})` with `listed` as its `listed_models`, parsed to the listed-only
+/// models.
+fn listed_of(listed: serde_json::Value) -> anyhow::Result<Vec<ListedModelConfig>> {
+    let mut list = one(serde_json::json!({}));
+    list["listed_models"] = listed;
+    parse(&list.to_string(), &defaults(), &process(), &lookup).map(|list| list.listed)
+}
+
+fn listed_error_of(listed: serde_json::Value) -> String {
+    listed_of(listed)
+        .expect_err("the list must be refused")
+        .to_string()
+}
+
+#[test]
+fn a_listed_model_takes_its_own_capacity_and_discount_and_nothing_else() {
+    // Process-level values that a served entry would fall back to.
+    let defaults = ModelDefaults {
+        capacity_requests_per_minute: 150,
+        discount_to_user: Some(0.3),
+        ..defaults()
+    };
+    let mut list = one(serde_json::json!({}));
+    list["listed_models"] = serde_json::json!([
+        {
+            "id": "example/decider",
+            "capacity_concurrency": 64,
+            "capacity_requests_per_minute": 600,
+            "discount_to_user": 0.2
+        },
+        {"id": "example/other"}
+    ]);
+    let parsed = parse(&list.to_string(), &defaults, &process(), &lookup).unwrap();
+    assert_eq!(parsed.models.len(), 1);
+    assert_eq!(
+        parsed.listed,
+        [
+            ListedModelConfig {
+                id: "example/decider".to_string(),
+                capacity_concurrency: 64,
+                capacity_requests_per_minute: 600,
+                discount_to_user: Some(0.2),
+            },
+            // Nothing declared and the list price: no process-level value.
+            ListedModelConfig {
+                id: "example/other".to_string(),
+                capacity_concurrency: 0,
+                capacity_requests_per_minute: 0,
+                discount_to_user: None,
+            },
+        ]
+    );
+    // A file without the key lists nothing besides its models.
+    assert!(listed_of(serde_json::json!([])).unwrap().is_empty());
+    let parsed = parse(
+        &one(serde_json::json!({})).to_string(),
+        &defaults,
+        &process(),
+        &lookup,
+    )
+    .unwrap();
+    assert!(parsed.listed.is_empty());
+}
+
+/// The `listed_models` example of `docs/gateway-mode.md` is one this code
+/// accepts.
+#[test]
+fn the_documented_listed_model_example_parses() {
+    let doc = include_str!("../docs/gateway-mode.md");
+    let (_, after) = doc
+        .split_once("#### Models listed but served elsewhere")
+        .expect("the section");
+    let (_, after) = after.split_once("```json\n").expect("the example");
+    let (example, _) = after.split_once("```").expect("the example's end");
+    let parsed = parse(example, &defaults(), &process(), &lookup).unwrap();
+    assert_eq!(parsed.models.len(), 1);
+    assert_eq!(parsed.listed.len(), 1);
+    assert_eq!(parsed.listed[0].id, "example/decider");
+    assert_eq!(parsed.listed[0].capacity_concurrency, 64);
+}
+
+#[test]
+fn a_listed_model_is_validated_like_an_entry_and_has_no_backend_keys() {
+    for (listed, expected) in [
+        (
+            serde_json::json!([{"id": ""}]),
+            "exact cloud-api model name",
+        ),
+        (
+            serde_json::json!([{"id": " m2"}]),
+            "exact cloud-api model name",
+        ),
+        (serde_json::json!([{}]), "missing field `id`"),
+        (
+            serde_json::json!([{"id": "m2", "discount_to_user": 1}]),
+            "VLLM_PROXY_DISCOUNT_TO_USER must be a number in [0, 1)",
+        ),
+        (
+            serde_json::json!([{"id": "m2", "discount_to_user": 0.12345}]),
+            "VLLM_PROXY_DISCOUNT_TO_USER must have at most four decimal places",
+        ),
+        (
+            serde_json::json!([{"id": "m2", "capacity_concurrency": -1}]),
+            "not a valid model list",
+        ),
+        // Nothing is served for it, so no key of a served entry is taken.
+        (
+            serde_json::json!([{"id": "m2", "backend_urls": ["https://b.example"]}]),
+            "unknown field `backend_urls`",
+        ),
+        (
+            serde_json::json!([{"id": "m2", "admission_max_inflight": 8}]),
+            "unknown field `admission_max_inflight`",
+        ),
+        (serde_json::json!({"id": "m2"}), "not a valid model list"),
+    ] {
+        let error = listed_error_of(listed.clone());
+        assert!(error.contains(expected), "{listed}: {error}");
+    }
+    // The model is named in the error, as for a served entry.
+    let error = listed_error_of(serde_json::json!([{"id": "m2", "discount_to_user": 1}]));
+    assert!(error.contains("listed model \"m2\""), "{error}");
+}
+
+#[test]
+fn an_id_is_served_or_listed_once() {
+    // The id of a served model.
+    let error = listed_error_of(serde_json::json!([{"id": "m"}]));
+    assert!(
+        error.contains("model \"m\" is listed more than once"),
+        "{error}"
+    );
+    // Twice in the listed-only models.
+    let error = listed_error_of(serde_json::json!([{"id": "m2"}, {"id": "m2"}]));
+    assert!(
+        error.contains("model \"m2\" is listed more than once"),
+        "{error}"
+    );
+    // Byte for byte, as for served models.
+    assert_eq!(
+        listed_of(serde_json::json!([{"id": "M"}])).unwrap()[0].id,
+        "M"
+    );
+    // A file has to serve something: listed-only models alone are refused.
+    let error = error_of(serde_json::json!({"models": [], "listed_models": [{"id": "m2"}]}));
+    assert!(error.contains("`models` is empty"), "{error}");
+}
+
+#[test]
+fn a_model_needs_backends_and_one_probe_for_each() {
+    let error = error_of(serde_json::json!({"models": [{"id": "m", "backend_urls": []}]}));
+    assert!(
+        error.contains("model \"m\"") && error.contains("`backend_urls` is empty"),
+        "{error}"
+    );
+    for url in ["", "a.example", "ftp://a.example"] {
+        let error = error_of(serde_json::json!({"models": [{"id": "m", "backend_urls": [url]}]}));
+        assert!(error.contains("is not an http(s) URL"), "{url:?}: {error}");
+    }
+    let error = error_of(one(serde_json::json!({
+        "backend_probe_urls": ["http://p1.example:8000", "http://p2.example:8000"]
+    })));
+    assert!(
+        error.contains(
+            "VLLM_BACKEND_PROBE_URLS must list one probe URL per VLLM_BACKEND_URLS entry"
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_tier_rules_of_the_variables_hold_for_an_entry() {
+    let cases = [
+        // A tier without a threshold, from the entry or the variable.
+        (
+            one(serde_json::json!({"long_context": {"backend_urls": ["https://a-long.example"]}})),
+            "VLLM_BACKEND_LONG_CONTEXT_URLS requires VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS",
+        ),
+        (
+            one(serde_json::json!({"long_context": {"backend_urls": [], "above_tokens": 1}})),
+            "`long_context.backend_urls` is empty",
+        ),
+        (
+            tiered(serde_json::json!({"borrowing": true}), serde_json::json!({})),
+            "VLLM_PROXY_ADMISSION_TIER_BORROWING requires admission",
+        ),
+        (
+            tiered(
+                serde_json::json!({"borrowing": true}),
+                serde_json::json!({"admission_max_inflight": 8}),
+            ),
+            "VLLM_PROXY_ADMISSION_TIER_BORROWING requires admission",
+        ),
+        (
+            tiered(
+                serde_json::json!({"reserved_inflight": 2}),
+                serde_json::json!({"admission_max_inflight": 8}),
+            ),
+            "VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT requires VLLM_PROXY_ADMISSION_TIER_BORROWING",
+        ),
+        (
+            tiered(
+                serde_json::json!({"borrowing": true, "max_inflight_per_host": 4, "reserved_inflight": 8}),
+                serde_json::json!({"admission_max_inflight": 8}),
+            ),
+            "VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT must be below VLLM_PROXY_ADMISSION_START_INFLIGHT",
+        ),
+        (
+            tiered(
+                serde_json::json!({"backend_urls": ["https://a.example"]}),
+                serde_json::json!({}),
+            ),
+            "is listed in both VLLM_BACKEND_URLS and VLLM_BACKEND_LONG_CONTEXT_URLS",
+        ),
+        // Probes for one tier only.
+        (
+            tiered(
+                serde_json::json!({}),
+                serde_json::json!({"backend_probe_urls": ["http://p1.example:8000"]}),
+            ),
+            "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS must list one probe URL per",
+        ),
+        (
+            tiered(
+                serde_json::json!({"backend_probe_urls": ["http://p2.example:8000"]}),
+                serde_json::json!({}),
+            ),
+            "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS must list one probe URL per",
+        ),
+        (
+            tiered(
+                serde_json::json!({"backend_probe_urls": ["http://p1.example:8000"]}),
+                serde_json::json!({"backend_probe_urls": ["http://p1.example:8000"]}),
+            ),
+            "is listed in both VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
+        ),
+    ];
+    for (list, expected) in cases {
+        let error = error_of(list.clone());
+        assert!(
+            error.contains("model \"m\"") && error.contains(expected),
+            "{list}: {error}"
+        );
+    }
+    // And a complete tier passes them.
+    parse_list(tiered(
+        serde_json::json!({
+            "backend_probe_urls": ["http://p2.example:8000"],
+            "strict": true,
+            "borrowing": true,
+            "max_inflight_per_host": 4,
+            "reserved_inflight": 4
+        }),
+        serde_json::json!({
+            "backend_probe_urls": ["http://p1.example:8000"],
+            "admission_max_inflight": 8
+        }),
+    ))
+    .unwrap();
+}
+
+#[test]
+fn the_admission_rules_of_the_variables_hold_for_an_entry() {
+    for (extra, expected) in [
+        (
+            serde_json::json!({"admission_max_inflight": 8, "admission_start_inflight": 9}),
+            "VLLM_PROXY_ADMISSION_START_INFLIGHT must be between 1 and VLLM_PROXY_ADMISSION_MAX_INFLIGHT",
+        ),
+        (
+            serde_json::json!({"admission_max_inflight": 8, "admission_start_inflight": 0}),
+            "VLLM_PROXY_ADMISSION_START_INFLIGHT must be between 1 and VLLM_PROXY_ADMISSION_MAX_INFLIGHT",
+        ),
+        (
+            serde_json::json!({"admission_max_inflight": 8, "admission_queue_saturated_at": 0}),
+            "VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT must be at least 1",
+        ),
+    ] {
+        let error = error_of(one(extra.clone()));
+        assert!(
+            error.contains("model \"m\"") && error.contains(expected),
+            "{extra}: {error}"
+        );
+    }
+    // The process-level half is checked for every entry that has a budget,
+    // even when the process-level budget itself is off.
+    let error = parse_with(
+        one(serde_json::json!({"admission_max_inflight": 8})),
+        &defaults(),
+        &ProcessSettings {
+            admission_retry_after_secs: 0,
+            ..process()
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1"),
+        "{error}"
+    );
+    // Without a budget there is nothing to check.
+    parse_list(one(serde_json::json!({"admission_queue_saturated_at": 0}))).unwrap();
+}
+
+#[test]
+fn discount_priority_and_reasoning_effort_are_validated() {
+    for (extra, expected) in [
+        (
+            serde_json::json!({"discount_to_user": 1}),
+            "VLLM_PROXY_DISCOUNT_TO_USER must be a number in [0, 1)",
+        ),
+        (
+            serde_json::json!({"discount_to_user": -0.1}),
+            "VLLM_PROXY_DISCOUNT_TO_USER must be a number in [0, 1)",
+        ),
+        (
+            serde_json::json!({"discount_to_user": 0.12345}),
+            "VLLM_PROXY_DISCOUNT_TO_USER must have at most four decimal places",
+        ),
+        (
+            serde_json::json!({"discount_to_user": "0.3"}),
+            "not a valid model list",
+        ),
+        (
+            serde_json::json!({"backend_priority": 1001}),
+            "VLLM_BACKEND_PRIORITY: priority must be within",
+        ),
+        (
+            serde_json::json!({"reasoning_off_effort": " "}),
+            "`reasoning_off_effort` is empty",
+        ),
+    ] {
+        let error = error_of(one(extra.clone()));
+        assert!(error.contains(expected), "{extra}: {error}");
+    }
+}
+
+/// `one(extra)` with a backend token, which a model with a map needs.
+fn one_lane(extra: serde_json::Value) -> serde_json::Value {
+    let mut extra = extra;
+    extra["backend_token_env"] = serde_json::json!("VLLM_BACKEND_TOKEN_ALPHA");
+    one(extra)
+}
+
+#[test]
+fn a_reasoning_effort_map_is_read_from_the_entry_that_writes_one() {
+    // The documented example: alpha maps one effort, the others none.
+    let models = parse_list(documented_list()).unwrap();
+    assert_eq!(models[0].reasoning_effort_map.get("high"), Some("xhigh"));
+    assert_eq!(models[0].reasoning_effort_map.get("xhigh"), None);
+    assert_eq!(models[0].reasoning_effort_map.get("low"), None);
+    assert!(models[1].reasoning_effort_map.is_empty());
+    assert!(models[2].reasoning_effort_map.is_empty());
+    let printed = format!("{:?}", models[0]);
+    assert!(
+        printed.contains(r#"reasoning_effort_map: {"high": "xhigh"}"#),
+        "{printed}"
+    );
+
+    // Several efforts may share a target; an empty object, `null` and no key
+    // at all are a model without a map, token or not.
+    let models = parse_list(one_lane(serde_json::json!({
+        "reasoning_effort_map": {"high": "xhigh", "max": "xhigh", "medium": "low"}
+    })))
+    .unwrap();
+    let map = &models[0].reasoning_effort_map;
+    assert_eq!(
+        [map.get("high"), map.get("max"), map.get("medium")],
+        [Some("xhigh"), Some("xhigh"), Some("low")]
+    );
+    for extra in [
+        serde_json::json!({"reasoning_effort_map": {}}),
+        serde_json::json!({"reasoning_effort_map": null}),
+        serde_json::json!({}),
+    ] {
+        let models = parse_list(one(extra.clone())).unwrap();
+        assert!(models[0].reasoning_effort_map.is_empty(), "{extra}");
+    }
+}
+
+#[test]
+fn a_reasoning_effort_map_of_another_shape_is_refused() {
+    for map in [
+        serde_json::json!("high=xhigh"),
+        serde_json::json!(["high", "xhigh"]),
+        serde_json::json!([{"high": "xhigh"}]),
+        serde_json::json!({"high": 1}),
+        serde_json::json!({"high": null}),
+        serde_json::json!({"high": ["xhigh"]}),
+        serde_json::json!({"high": {"effort": "xhigh"}}),
+        serde_json::json!(true),
+    ] {
+        let error = error_of(one_lane(serde_json::json!({"reasoning_effort_map": map})));
+        assert!(error.contains("not a valid model list"), "{map}: {error}");
+    }
+    // A key written twice is not settled by which one came last, and is
+    // refused like every other rule of the map, with the model named.
+    // (Written out: a `json!` object cannot hold it.)
+    let error = parse(
+        r#"{"models": [{
+            "id": "m",
+            "backend_urls": ["https://a.example"],
+            "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
+            "reasoning_effort_map": {"high": "xhigh", "high": "max"}
+        }]}"#,
+        &defaults(),
+        &process(),
+        &lookup,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("model \"m\": `reasoning_effort_map`: \"high\" is a key more than once"),
+        "{error}"
+    );
+    // It is a key of a model, not of its tier or of the file.
+    for list in [
+        tiered(
+            serde_json::json!({"reasoning_effort_map": {"high": "xhigh"}}),
+            serde_json::json!({}),
+        ),
+        serde_json::json!({
+            "models": [{"id": "m", "backend_urls": ["https://a.example"]}],
+            "reasoning_effort_map": {"high": "xhigh"}
+        }),
+    ] {
+        let error = error_of(list);
+        assert!(
+            error.contains("unknown field `reasoning_effort_map`"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_reasoning_effort_map_is_validated() {
+    for (map, expected) in [
+        // A chain: the result would depend on the order of two lookups.
+        (
+            serde_json::json!({"high": "xhigh", "xhigh": "max"}),
+            "\"high\" becomes \"xhigh\", which is itself a key",
+        ),
+        (
+            serde_json::json!({"high": "high"}),
+            "\"high\" becomes \"high\", which is itself a key",
+        ),
+        (
+            serde_json::json!({"": "xhigh"}),
+            "every key and value must be 1 to 32 characters",
+        ),
+        (
+            serde_json::json!({"high": ""}),
+            "every key and value must be 1 to 32 characters",
+        ),
+        (
+            serde_json::json!({"high": "x high"}),
+            "every key and value must be 1 to 32 characters",
+        ),
+        (
+            serde_json::json!({"high": "x".repeat(33)}),
+            "every key and value must be 1 to 32 characters",
+        ),
+        // The off values and the off effort belong to `reasoning_off_effort`
+        // (the built-in `none` here).
+        (
+            serde_json::json!({"none": "low"}),
+            "\"none\" cannot be a key",
+        ),
+        (
+            serde_json::json!({"minimal": "low"}),
+            "\"minimal\" cannot be a key",
+        ),
+        (
+            serde_json::json!({"high": "minimal"}),
+            "\"high\" cannot become \"minimal\"",
+        ),
+    ] {
+        let error = error_of(one_lane(
+            serde_json::json!({"reasoning_effort_map": map.clone()}),
+        ));
+        assert!(
+            error.contains("model \"m\": `reasoning_effort_map`") && error.contains(expected),
+            "{map}: {error}"
+        );
+    }
+    let too_many: serde_json::Map<String, serde_json::Value> = (0..17)
+        .map(|n| (format!("effort-{n}"), serde_json::json!("xhigh")))
+        .collect();
+    let error = error_of(one_lane(
+        serde_json::json!({"reasoning_effort_map": too_many}),
+    ));
+    assert!(error.contains("more than 16 entries"), "{error}");
+}
+
+#[test]
+fn a_reasoning_effort_map_is_checked_against_the_off_effort_the_model_resolves_to() {
+    let low_by_default = ModelDefaults {
+        reasoning_off_effort: "low".to_string(),
+        ..defaults()
+    };
+    let parsed = |extra: serde_json::Value, defaults: &ModelDefaults| {
+        parse_with(one_lane(extra), defaults, &process())
+            .map(|models| models[0].clone())
+            .map_err(|error| error.to_string())
+    };
+
+    // The entry's own off effort.
+    let error = parsed(
+        serde_json::json!({
+            "reasoning_off_effort": "low",
+            "reasoning_effort_map": {"low": "medium"}
+        }),
+        &defaults(),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("\"low\" cannot be a key: it is this model's `reasoning_off_effort`"),
+        "{error}"
+    );
+    let error = parsed(
+        serde_json::json!({
+            "reasoning_off_effort": "low",
+            "reasoning_effort_map": {"high": "none"}
+        }),
+        &defaults(),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("\"high\" cannot become \"none\"") && error.contains("(\"low\")"),
+        "{error}"
+    );
+
+    // The process-level one, for an entry that leaves it out ...
+    let error = parsed(
+        serde_json::json!({"reasoning_effort_map": {"low": "medium"}}),
+        &low_by_default,
+    )
+    .unwrap_err();
+    assert!(error.contains("\"low\" cannot be a key"), "{error}");
+    // ... and not for one that has its own: `low` is an effort like any
+    // other for this model, and `none` is its off effort.
+    let model = parsed(
+        serde_json::json!({
+            "reasoning_off_effort": "none",
+            "reasoning_effort_map": {"low": "medium", "max": "none"}
+        }),
+        &low_by_default,
+    )
+    .unwrap();
+    assert_eq!(model.reasoning_off_effort, "none");
+    assert_eq!(model.reasoning_effort_map.get("low"), Some("medium"));
+    assert_eq!(model.reasoning_effort_map.get("max"), Some("none"));
+    // The model's off effort as a target, when it is not an off value.
+    let model = parsed(
+        serde_json::json!({"reasoning_effort_map": {"medium": "low"}}),
+        &low_by_default,
+    )
+    .unwrap();
+    assert_eq!(model.reasoning_effort_map.get("medium"), Some("low"));
+}
+
+#[test]
+fn a_reasoning_effort_map_requires_a_backend_token() {
+    // The reasoning handling only runs for a model with a backend token, so
+    // a map without one would be configured and never applied.
+    let error = error_of(one(
+        serde_json::json!({"reasoning_effort_map": {"high": "xhigh"}}),
+    ));
+    assert!(
+        error.contains("model \"m\": `reasoning_effort_map` requires a backend token"),
+        "{error}"
+    );
+    // The model's own token or the process-level one.
+    parse_list(one_lane(
+        serde_json::json!({"reasoning_effort_map": {"high": "xhigh"}}),
+    ))
+    .unwrap();
+    let with_default_token = ModelDefaults {
+        backend_token: Some("shared-secret".to_string()),
+        ..defaults()
+    };
+    parse_with(
+        one(serde_json::json!({"reasoning_effort_map": {"high": "xhigh"}})),
+        &with_default_token,
+        &process(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn merge_system_messages_is_read_from_the_entry_that_writes_it() {
+    // The documented example: alpha's template needs it, the others' do not.
+    let models = parse_list(documented_list()).unwrap();
+    assert!(models[0].merge_system_messages);
+    assert!(!models[1].merge_system_messages);
+    assert!(!models[2].merge_system_messages);
+    let printed = format!("{:?}", models[0]);
+    assert!(printed.contains("merge_system_messages: true"), "{printed}");
+    let printed = format!("{:?}", models[1]);
+    assert!(
+        printed.contains("merge_system_messages: false"),
+        "{printed}"
+    );
+
+    // Written out either way or left out, and with a backend token or
+    // without one: it is no part of the reasoning handling.
+    for (extra, expected) in [
+        (serde_json::json!({"merge_system_messages": true}), true),
+        (serde_json::json!({"merge_system_messages": false}), false),
+        (serde_json::json!({}), false),
+    ] {
+        for list in [one(extra.clone()), one_lane(extra.clone())] {
+            let models = parse_list(list).unwrap();
+            assert_eq!(models[0].merge_system_messages, expected, "{extra}");
+        }
+    }
+
+    // No process-level value reaches it: a model that does not write the key
+    // does not have it, whatever the defaults of the other keys are.
+    let everything_set = ModelDefaults {
+        admission_max_inflight: 8,
+        reasoning_off_effort: "low".to_string(),
+        backend_token: Some("shared-secret".to_string()),
+        ..defaults()
+    };
+    let models = parse_with(one(serde_json::json!({})), &everything_set, &process()).unwrap();
+    assert!(!models[0].merge_system_messages);
+}
+
+#[test]
+fn a_merge_system_messages_that_is_not_a_boolean_is_refused() {
+    for value in [
+        serde_json::json!("true"),
+        serde_json::json!("false"),
+        serde_json::json!(""),
+        serde_json::json!(1),
+        serde_json::json!(0),
+        serde_json::json!(null),
+        serde_json::json!([true]),
+        serde_json::json!({"enabled": true}),
+    ] {
+        let error = error_of(one(serde_json::json!({"merge_system_messages": value})));
+        assert!(
+            error.contains("not a valid model list") && error.contains("expected a boolean"),
+            "{value}: {error}"
+        );
+    }
+    // Written twice, it is not settled by which one came last.
+    // (Written out: a `json!` object cannot hold it.)
+    let error = parse(
+        r#"{"models": [{
+            "id": "m",
+            "backend_urls": ["https://a.example"],
+            "merge_system_messages": true,
+            "merge_system_messages": false
+        }]}"#,
+        &defaults(),
+        &process(),
+        &lookup,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("duplicate field `merge_system_messages`"),
+        "{error}"
+    );
+    // It is a key of a model, not of its tier or of the file.
+    for list in [
+        tiered(
+            serde_json::json!({"merge_system_messages": true}),
+            serde_json::json!({}),
+        ),
+        serde_json::json!({
+            "models": [{"id": "m", "backend_urls": ["https://a.example"]}],
+            "merge_system_messages": true
+        }),
+    ] {
+        let error = error_of(list);
+        assert!(
+            error.contains("unknown field `merge_system_messages`"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_token_variable_must_be_of_the_backend_token_family_and_set() {
+    let error = error_of(one(
+        serde_json::json!({"backend_token_env": "VLLM_BACKEND_TOKEN_UNSET"}),
+    ));
+    assert!(
+        error.contains("model \"m\"")
+            && error
+                .contains("`backend_token_env` names VLLM_BACKEND_TOKEN_UNSET, which is not set"),
+        "{error}"
+    );
+    let error = error_of(one(
+        serde_json::json!({"backend_token_env": "VLLM_BACKEND_TOKEN_BLANK"}),
+    ));
+    assert!(error.contains("which is not set"), "{error}");
+    // Another secret of the process, or the token pasted where its
+    // variable's name belongs: refused, and not repeated in the message.
+    for name in [
+        "CLOUD_API_USAGE_TOKEN",
+        "TOKEN",
+        "sk-live-pasted-secret",
+        "VLLM_BACKEND_TOKEN pasted-secret",
+        "",
+    ] {
+        let error = error_of(one(serde_json::json!({"backend_token_env": name})));
+        assert!(
+            error.contains(
+                "must be the name of an environment variable starting with VLLM_BACKEND_TOKEN"
+            ),
+            "{name:?}: {error}"
+        );
+        // (`TOKEN` alone is part of the family's own name.)
+        assert!(
+            name.is_empty() || name == "TOKEN" || !error.contains(name),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_backend_token_requires_a_process_that_can_bill() {
+    let cannot_bill = ProcessSettings {
+        bills_usage: false,
+        ..process()
+    };
+    let with_default_token = ModelDefaults {
+        backend_token: Some("shared-secret".to_string()),
+        ..defaults()
+    };
+    for (list, defaults) in [
+        (
+            one(serde_json::json!({"backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA"})),
+            defaults(),
+        ),
+        (one(serde_json::json!({})), with_default_token),
+    ] {
+        let error = parse_with(list, &defaults, &cannot_bill)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("VLLM_BACKEND_TOKEN requires billing"),
+            "{error}"
+        );
+    }
+    // No token, nothing to bill for.
+    parse_with(one(serde_json::json!({})), &defaults(), &cannot_bill).unwrap();
+    // The SQS transport bills without cloud-api: the same token is accepted.
+    let sqs_bills = ProcessSettings {
+        bills_usage: true,
+        ..process()
+    };
+    parse_with(
+        one(serde_json::json!({"backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA"})),
+        &defaults(),
+        &sqs_bills,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_backend_or_a_probe_belongs_to_one_model() {
+    let error = error_of(serde_json::json!({"models": [
+        {"id": "a", "backend_urls": ["https://shared.example", "https://a.example"]},
+        {"id": "b", "backend_urls": ["https://shared.example/"]}
+    ]}));
+    assert!(
+        error.contains("backend URL https://shared.example is listed under both \"a\" and \"b\""),
+        "{error}"
+    );
+    // One model's long-context host is not another model's base host either.
+    let error = error_of(serde_json::json!({"models": [
+        {
+            "id": "a",
+            "backend_urls": ["https://a.example"],
+            "long_context": {"backend_urls": ["https://shared.example"], "above_tokens": 1}
+        },
+        {"id": "b", "backend_urls": ["https://shared.example"]}
+    ]}));
+    assert!(
+        error.contains("is listed under both \"a\" and \"b\""),
+        "{error}"
+    );
+    let error = error_of(serde_json::json!({"models": [
+        {
+            "id": "a",
+            "backend_urls": ["https://a.example"],
+            "backend_probe_urls": ["http://shared.example:8000"]
+        },
+        {
+            "id": "b",
+            "backend_urls": ["https://b.example"],
+            "backend_probe_urls": ["http://shared.example:8000"]
+        }
+    ]}));
+    assert!(
+        error.contains("probe URL http://shared.example:8000 is listed under both \"a\" and \"b\""),
+        "{error}"
+    );
+}
+
+#[test]
+fn one_backend_under_two_spellings_is_still_one_backend() {
+    let two = |a: &str, b: &str, key: &str| {
+        let mut model_a = serde_json::json!({"id": "a", "backend_urls": ["https://a.example"]});
+        let mut model_b = serde_json::json!({"id": "b", "backend_urls": ["https://b.example"]});
+        model_a[key] = serde_json::json!([a]);
+        model_b[key] = serde_json::json!([b]);
+        serde_json::json!({"models": [model_a, model_b]})
+    };
+    // The host in another case, the scheme's own port written out, a path
+    // that resolves to the same place, a trailing dot on the host, and an
+    // address written another way: one endpoint each.
+    let same = [
+        ("http://shared.example:8000", "http://SHARED.example:8000"),
+        ("https://shared.example", "https://shared.example:443"),
+        ("http://shared.example", "http://shared.example:80/"),
+        ("https://shared.example", "https://shared.example/v1/.."),
+        ("https://shared.example/v1", "https://shared.example/v1/./"),
+        ("https://shared.example", "https://shared.example."),
+        ("https://shared.example", "HTTPS://Shared.Example"),
+        ("http://127.0.0.1:8000", "http://127.1:8000"),
+    ];
+    for key in ["backend_urls", "backend_probe_urls"] {
+        let what = if key == "backend_urls" {
+            "backend URL"
+        } else {
+            "probe URL"
+        };
+        for (first, second) in same {
+            let error = error_of(two(first, second, key));
+            assert!(
+                error.contains(what)
+                    && error.contains(&format!("is the same endpoint as {first}"))
+                    && error.contains("is listed under both \"a\" and \"b\""),
+                "{first} / {second}: {error}"
+            );
+        }
+    }
+    // The long-context tier of one model against the base tier of another.
+    let error = error_of(serde_json::json!({"models": [
+        {
+            "id": "a",
+            "backend_urls": ["https://a.example"],
+            "long_context": {"backend_urls": ["https://Shared.example:443"], "above_tokens": 1}
+        },
+        {"id": "b", "backend_urls": ["https://shared.example"]}
+    ]}));
+    assert!(
+        error.contains("is the same endpoint as https://Shared.example:443"),
+        "{error}"
+    );
+
+    // Another port, scheme, path or host is another backend.
+    let different = [
+        ("https://shared.example", "https://shared.example:8443"),
+        ("http://shared.example", "https://shared.example"),
+        ("https://shared.example/a", "https://shared.example/b"),
+        ("https://shared.example", "https://shared.example.org"),
+        ("http://127.0.0.1:8000", "http://127.0.0.2:8000"),
+    ];
+    for (first, second) in different {
+        let models = parse_list(two(first, second, "backend_urls"))
+            .unwrap_or_else(|error| panic!("{first} / {second}: {error}"));
+        // The URLs are kept as they were written; only the comparison is
+        // on where they point.
+        assert_eq!(models[0].backend_urls, [first]);
+        assert_eq!(models[1].backend_urls, [second]);
+    }
+}
+
+#[test]
+fn one_backend_serves_one_tier_however_it_is_spelled() {
+    // The tier rules of the variables, with the comparison a list makes.
+    let error = error_of(tiered(
+        serde_json::json!({"backend_urls": ["https://A.example:443/"]}),
+        serde_json::json!({}),
+    ));
+    assert!(
+        error.contains("model \"m\"")
+            && error
+                .contains("is listed in both VLLM_BACKEND_URLS and VLLM_BACKEND_LONG_CONTEXT_URLS"),
+        "{error}"
+    );
+    let error = error_of(tiered(
+        serde_json::json!({"backend_probe_urls": ["http://P1.example:8000"]}),
+        serde_json::json!({"backend_probe_urls": ["http://p1.example:8000/"]}),
+    ));
+    assert!(
+        error.contains(
+            "is listed in both VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS"
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_backend_url_is_a_base_url_without_credentials() {
+    for url in [
+        "https://a.example?x=1",
+        "https://a.example/v1?x=1",
+        "https://a.example#top",
+    ] {
+        let error = error_of(serde_json::json!({"models": [{"id": "m", "backend_urls": [url]}]}));
+        assert!(
+            error.contains("must be a base URL, without a query or fragment"),
+            "{url}: {error}"
+        );
+    }
+    // Credentials do not belong in the file, and are not repeated.
+    for url in [
+        "https://operator:pasted-secret@a.example",
+        "https://pasted-secret@a.example",
+    ] {
+        for key in ["backend_urls", "backend_probe_urls"] {
+            let mut model = serde_json::json!({"id": "m", "backend_urls": ["https://a.example"]});
+            model[key] = serde_json::json!([url]);
+            let error = error_of(serde_json::json!({"models": [model]}));
+            assert!(
+                error.contains(&format!("`{key}`: a URL must not carry credentials")),
+                "{error}"
+            );
+            assert!(!error.contains("pasted-secret"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn a_requested_model_is_exact_a_case_variant_another_string_or_missing() {
+    let ids = ["org/Model-A", "org/model-b"];
+    let class = |requested: Option<&str>| classify(requested, ids.iter().copied());
+    assert_eq!(class(Some("org/Model-A")), ModelMatch::Exact);
+    assert_eq!(class(Some("org/model-b")), ModelMatch::Exact);
+    assert_eq!(class(Some("org/model-a")), ModelMatch::CaseDiffers);
+    assert_eq!(class(Some("ORG/MODEL-B")), ModelMatch::CaseDiffers);
+    assert_eq!(class(Some("org/model-c")), ModelMatch::Other);
+    assert_eq!(class(Some("")), ModelMatch::Other);
+    assert_eq!(class(Some(" org/model-b")), ModelMatch::Other);
+    assert_eq!(class(None), ModelMatch::Missing);
+
+    // Only a string is a model name.
+    let requested = |body: serde_json::Value| requested_model(&body).map(str::to_string);
+    assert_eq!(
+        requested(serde_json::json!({"model": "m"})).as_deref(),
+        Some("m")
+    );
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({"model": null}),
+        serde_json::json!({"model": 7}),
+        serde_json::json!({"model": ["m"]}),
+        serde_json::json!({"model": {"id": "m"}}),
+        serde_json::json!([]),
+    ] {
+        assert_eq!(requested(body.clone()), None, "{body}");
+    }
+    assert_eq!(
+        [
+            ModelMatch::Exact,
+            ModelMatch::CaseDiffers,
+            ModelMatch::Other,
+            ModelMatch::Missing
+        ]
+        .map(ModelMatch::as_str),
+        ["exact", "case_differs", "other", "missing"]
+    );
+}
+
+#[derive(Clone, Default)]
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_single_models_log_lines_carry_no_model_field() {
+    let admission = || {
+        Some(crate::admission::AdmissionConfig {
+            max_inflight: 1,
+            tier_borrowing: false,
+            long_max_inflight_per_host: 0,
+            long_reserved_inflight: 0,
+            start_inflight: 1,
+            ramp_step: 8,
+            ramp_interval: Duration::from_secs(1800),
+            ttft_p95_max: None,
+            backpressure_ttl: Duration::from_secs(10),
+            queue_saturated_at: 1,
+            retry_after: Duration::from_secs(2),
+        })
+    };
+    let engine = || Arc::new(EngineLoad::disabled());
+    // The lines a lane writes are shared code: the same call, once for the
+    // single model of a process and once for an entry of a list.
+    let refuse_once_each = || {
+        AdmissionController::new(admission(), 1, engine())
+            .reject(crate::admission::RejectReason::Budget);
+        AdmissionController::for_model(Some("example/alpha"), admission(), 1, engine())
+            .reject(crate::admission::RejectReason::Budget);
+    };
+
+    // tracing caches a callsite's interest for the whole process, and while
+    // exactly one subscriber is registered it derives that from the calling
+    // thread's default: another test's thread, which has none, would switch
+    // these shared callsites off for this capture too. A second registered
+    // dispatcher makes it ask every registered subscriber instead.
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    refuse_once_each();
+    drop(guard);
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        captured.lines().collect::<Vec<_>>(),
+        [
+            "DEBUG vllm_proxy_rs::admission: Lane request refused at admission reason=\"budget\"",
+            "DEBUG vllm_proxy_rs::admission: Lane request refused at admission model=\"example/alpha\" reason=\"budget\"",
+        ]
+    );
+
+    // And as JSON (`LOG_FORMAT=json`).
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    refuse_once_each();
+    drop(guard);
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let fields: Vec<serde_json::Value> = captured
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["fields"].take())
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            serde_json::json!({"message": "Lane request refused at admission", "reason": "budget"}),
+            serde_json::json!({
+                "message": "Lane request refused at admission",
+                "model": "example/alpha",
+                "reason": "budget"
+            }),
+        ]
+    );
+}
+
+const FORM_ROUTES: [(&str, &[&str]); 2] = [
+    ("/v1/images/edits", &IMAGE_EDIT_FORM_FIELDS),
+    ("/v1/audio/transcriptions", &AUDIO_TRANSCRIPTION_FORM_FIELDS),
+];
+
+fn form_field_refusal(route: &str, supported: &[&str], name: &str) -> String {
+    match guard_form_field_name(route, supported, name) {
+        Err(AppError::BadRequest(message)) => message,
+        other => panic!("{route} {name:?}: expected a 400, got {other:?}"),
+    }
+}
+
+#[test]
+fn form_fields_on_a_routes_list_are_accepted() {
+    for (route, supported) in FORM_ROUTES {
+        for name in supported {
+            assert!(
+                guard_form_field_name(route, supported, name).is_ok(),
+                "{route} {name}"
+            );
+        }
+    }
+    for name in ["model", "prompt", "image", "image[]", "mask", "size"] {
+        assert!(IMAGE_EDIT_FORM_FIELDS.contains(&name), "{name}");
+    }
+    for name in [
+        "file",
+        "model",
+        "language",
+        "prompt",
+        "response_format",
+        "temperature",
+        "timestamp_granularities[]",
+    ] {
+        assert!(AUDIO_TRANSCRIPTION_FORM_FIELDS.contains(&name), "{name}");
+    }
+}
+
+#[test]
+fn a_form_field_off_a_routes_list_is_refused_by_name() {
+    for (route, supported, names) in [
+        (
+            "/v1/images/edits",
+            &IMAGE_EDIT_FORM_FIELDS[..],
+            &[
+                "url",
+                "url[]",
+                "perf_dump_path",
+                "upscaling_model_path",
+                "enhance_prompt",
+                "file",
+                "unknown",
+            ][..],
+        ),
+        (
+            "/v1/audio/transcriptions",
+            &AUDIO_TRANSCRIPTION_FORM_FIELDS[..],
+            &["url", "stream", "seed", "image", "user", "unknown"][..],
+        ),
+    ] {
+        for name in names {
+            assert_eq!(
+                form_field_refusal(route, supported, name),
+                format!("`{name}` is not a supported form field on {route}")
+            );
+        }
+    }
+}
+
+#[test]
+fn a_form_field_name_is_matched_byte_for_byte() {
+    for (route, supported, names) in [
+        (
+            "/v1/images/edits",
+            &IMAGE_EDIT_FORM_FIELDS[..],
+            &["Prompt", "IMAGE", " image", "image ", "image[0]", "mask[]"][..],
+        ),
+        (
+            "/v1/audio/transcriptions",
+            &AUDIO_TRANSCRIPTION_FORM_FIELDS[..],
+            &["File", " file", "file[]", "timestamp_granularities"][..],
+        ),
+    ] {
+        for name in names {
+            assert!(
+                form_field_refusal(route, supported, name).contains(name),
+                "{route} {name:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_form_field_without_a_name_or_with_a_long_one_is_refused_unnamed() {
+    let long = "x".repeat(FORM_FIELD_ECHO_MAX_BYTES + 1);
+    let longest = "x".repeat(FORM_FIELD_ECHO_MAX_BYTES);
+    for (route, supported) in FORM_ROUTES {
+        for name in ["", long.as_str()] {
+            assert_eq!(
+                form_field_refusal(route, supported, name),
+                format!("The form has a field that is not supported on {route}")
+            );
+        }
+        assert!(form_field_refusal(route, supported, &longest).contains(&longest));
+    }
+}
+
+#[test]
+fn a_lora_form_field_keeps_the_lora_refusal() {
+    for (route, supported) in FORM_ROUTES {
+        for name in LORA_SELECTOR_KEYS {
+            assert_eq!(
+                form_field_refusal(route, supported, name),
+                format!("`{name}` is not supported: the model is chosen by `model` alone")
+            );
+        }
+    }
+}
+
+#[test]
+fn per_host_caps_are_read_per_tier_and_checked() {
+    let models = parse_list(tiered(
+        serde_json::json!({"backend_max_inflight": [8]}),
+        serde_json::json!({"backend_max_inflight": [null], "admission_max_inflight": 48}),
+    ))
+    .unwrap();
+    assert_eq!(models[0].backend_max_inflight, vec![None]);
+    assert_eq!(models[0].backend_long_context_max_inflight, vec![Some(8)]);
+    // Absent keys: no caps, as before.
+    let models = parse_list(one(serde_json::json!({}))).unwrap();
+    assert!(models[0].backend_max_inflight.is_empty());
+    assert!(models[0].backend_long_context_max_inflight.is_empty());
+
+    let cases = [
+        (
+            one(
+                serde_json::json!({"backend_max_inflight": [64, 64], "admission_max_inflight": 48}),
+            ),
+            "`backend_max_inflight` has 2 entries but its tier lists 1 backends",
+        ),
+        (
+            one(serde_json::json!({"backend_max_inflight": [], "admission_max_inflight": 48})),
+            "`backend_max_inflight` has 0 entries",
+        ),
+        (
+            one(serde_json::json!({"backend_max_inflight": [0], "admission_max_inflight": 48})),
+            "`backend_max_inflight`: 0 is not a positive integer",
+        ),
+        (
+            one(serde_json::json!({"backend_max_inflight": [-3], "admission_max_inflight": 48})),
+            "`backend_max_inflight`: -3 is not a positive integer",
+        ),
+        (
+            tiered(
+                serde_json::json!({"backend_max_inflight": [1, 2]}),
+                serde_json::json!({}),
+            ),
+            "`long_context.backend_max_inflight` has 2 entries",
+        ),
+        (
+            tiered(
+                serde_json::json!({"backend_max_inflight": [0]}),
+                serde_json::json!({}),
+            ),
+            "`long_context.backend_max_inflight`: 0 is not a positive integer",
+        ),
+        (
+            one(serde_json::json!({"backend_max_inflight": [64]})),
+            "`backend_max_inflight` needs admission",
+        ),
+    ];
+    for (list, expected) in cases {
+        let error = error_of(list);
+        assert!(
+            error.contains("model \"m\"") && error.contains(expected),
+            "{expected}: {error}"
+        );
+    }
+}

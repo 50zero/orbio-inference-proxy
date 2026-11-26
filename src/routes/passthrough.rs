@@ -1,0 +1,791 @@
+use axum::body::Body;
+use axum::extract::multipart::Field;
+use axum::extract::{Multipart, State};
+use axum::http::HeaderMap;
+use axum::response::Response;
+use axum::Extension;
+use sha2::Digest;
+
+use crate::auth::RequireAuth;
+use crate::backend_pool::BackendGuard;
+use crate::encryption::{self, Endpoint};
+use crate::error::AppError;
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageReporter, UsageType};
+use crate::routes::chat::read_body_with_limit;
+use crate::{AppState, TracingIds};
+
+struct PassthroughTarget<'a> {
+    client: &'a reqwest::Client,
+    url: String,
+    backend_guard: Option<BackendGuard>,
+}
+
+/// Resolve the transport boundary shared by passthrough routes. Configured
+/// overrides are outside the backend pool and must not receive its bearer.
+fn passthrough_target<'a>(
+    state: &'a AppState,
+    override_url: Option<&str>,
+    pool_path: &str,
+) -> PassthroughTarget<'a> {
+    match override_url {
+        Some(url) => PassthroughTarget {
+            client: &state.http_client,
+            url: url.to_string(),
+            backend_guard: None,
+        },
+        None => {
+            let (url, guard) = state.backend_pool.select_url(pool_path);
+            PassthroughTarget {
+                client: &state.backend_client,
+                url,
+                backend_guard: Some(guard),
+            }
+        }
+    }
+}
+
+/// POST /v1/tokenize — simple proxy, no signing.
+pub async fn tokenize(
+    State(state): State<AppState>,
+    auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
+    let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
+    let mut request_json = proxy::parse_json_object(&request_body)?;
+    crate::model_list::guard_passthrough_body(&state, &request_json)?;
+    guard_direct_model(&state, &request_json, auth.cloud_api_key.is_some())?;
+    // The same rules as the chat and completions routes, and media inlining
+    // (`forward_body.rs`): the engine builds a chat or completion request
+    // from this body. A changed body is re-serialized; otherwise the original
+    // bytes go through.
+    let changed = crate::forward_body::prepare(
+        &state.config,
+        crate::forward_body::Rules::Completion,
+        &mut request_json,
+    )
+    .await?;
+    let forward_body = if changed {
+        serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?
+    } else {
+        request_body
+    };
+
+    let (url, _guard) = state.backend_pool.select_url("/tokenize");
+    proxy::proxy_simple(
+        &state.backend_client,
+        &url,
+        reqwest::Method::POST,
+        Some(&forward_body),
+        "application/json",
+        Some(std::time::Duration::from_secs(
+            state.config.timeout_tokenize_secs,
+        )),
+        Some(&tracing_ids),
+    )
+    .await
+}
+
+/// POST /v1/embeddings — JSON proxy with signing.
+pub async fn embeddings(
+    State(state): State<AppState>,
+    auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
+    let reporter = make_usage_reporter(&auth, &state);
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+
+    json_passthrough_encrypted(
+        state,
+        body,
+        "/v1/embeddings",
+        None,
+        "emb",
+        |c| c.max_request_size,
+        reporter,
+        UsageType::Embedding,
+        tracing_ids,
+        enc_ctx,
+        Endpoint::Embeddings,
+        auth.cloud_api_key.is_some(),
+    )
+    .await
+}
+
+/// POST /v1/rerank — JSON proxy with signing.
+pub async fn rerank(
+    State(state): State<AppState>,
+    auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
+    let reporter = make_usage_reporter(&auth, &state);
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    let url_override = state.config.rerank_url_override.clone();
+    // The permit is held until the complete upstream response is read.
+    let _permit = state.rerank_limiter.admit(&auth)?;
+
+    json_passthrough_encrypted(
+        state,
+        body,
+        "/v1/rerank",
+        url_override.as_deref(),
+        "rerank",
+        |c| c.max_request_size,
+        reporter,
+        UsageType::Rerank,
+        tracing_ids,
+        enc_ctx,
+        Endpoint::Rerank,
+        auth.cloud_api_key.is_some(),
+    )
+    .await
+}
+
+/// POST /v1/score — JSON proxy with signing.
+pub async fn score(
+    State(state): State<AppState>,
+    auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
+    let reporter = make_usage_reporter(&auth, &state);
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    let url_override = state.config.score_url_override.clone();
+
+    json_passthrough_encrypted(
+        state,
+        body,
+        "/v1/score",
+        url_override.as_deref(),
+        "score",
+        |c| c.max_request_size,
+        reporter,
+        UsageType::Score,
+        tracing_ids,
+        enc_ctx,
+        Endpoint::Score,
+        auth.cloud_api_key.is_some(),
+    )
+    .await
+}
+
+/// POST /v1/images/generations — JSON proxy with signing.
+pub async fn images_generations(
+    State(state): State<AppState>,
+    auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
+    let reporter = make_usage_reporter(&auth, &state);
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    let url_override = state.config.images_url_override.clone();
+
+    json_passthrough_encrypted(
+        state,
+        body,
+        "/v1/images/generations",
+        url_override.as_deref(),
+        "img",
+        |c| c.max_image_request_size,
+        reporter,
+        UsageType::ImageGeneration,
+        tracing_ids,
+        enc_ctx,
+        Endpoint::ImagesGenerations,
+        auth.cloud_api_key.is_some(),
+    )
+    .await
+}
+
+/// POST /v1/images/edits — multipart proxy with signing.
+pub async fn images_edits(
+    State(state): State<AppState>,
+    auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Response, AppError> {
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    let max_size = state.config.max_image_request_size;
+    let mut form = reqwest::multipart::Form::new();
+    let mut total_size: usize = 0;
+    let mut hasher = sha2::Sha256::new();
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Invalid multipart: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        crate::model_list::guard_form_field_name(
+            super::ROUTE_IMAGES_EDITS,
+            &crate::model_list::IMAGE_EDIT_FORM_FIELDS,
+            &name,
+        )?;
+        let file_name = field.file_name().map(|s| s.to_string());
+        let content_type = field.content_type().map(|s| s.to_string());
+
+        if let (true, Some(ctx)) = (name == "prompt", enc_ctx.as_ref()) {
+            // Read field, hash the raw (encrypted) bytes, then decrypt for forwarding
+            let raw_data =
+                read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            let text = String::from_utf8(raw_data)
+                .map_err(|_| AppError::BadRequest("prompt field is not UTF-8".to_string()))?;
+            let data = if !text.is_empty() {
+                encryption::decrypt_string_for_field(&text, ctx, &state.signing, "prompt")?
+                    .into_bytes()
+            } else {
+                text.into_bytes()
+            };
+            let part = build_multipart_part(data, file_name, content_type)?;
+            form = form.part(name, part);
+        } else {
+            refuse_media_with_all_fields(
+                enc_ctx.as_ref(),
+                &name,
+                file_name.as_deref(),
+                content_type.as_deref(),
+            )?;
+            let data =
+                read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            crate::model_list::guard_form_field(&state, &name, &data)?;
+            guard_direct_form_model(&state, &name, &data, auth.cloud_api_key.is_some())?;
+            if crate::request_guard::IMAGE_BOUNDED_FIELDS.contains(&name.as_str()) {
+                state
+                    .config
+                    .request_guard
+                    .check_image_field(&name, &String::from_utf8_lossy(&data))?;
+            }
+            // Engine-internal fields are dropped (`request_guard.rs`). The hash above still binds what was sent.
+            if !state.config.request_guard.keep_form_field(&name, &data)? {
+                continue;
+            }
+            let part = build_multipart_part(data, file_name, content_type)?;
+            form = form.part(name, part);
+        }
+    }
+
+    let request_sha256 = hex::encode(hasher.finalize());
+
+    let response_transform = enc_ctx.as_ref().map(|ctx| {
+        encryption::make_response_transform(
+            Endpoint::ImagesEdits,
+            ctx.clone(),
+            state.signing.clone(),
+        )
+    });
+    let target = passthrough_target(
+        &state,
+        state.config.images_edits_url_override.as_deref(),
+        "/v1/images/edits",
+    );
+
+    let opts = ProxyOpts {
+        signing: state.signing.clone(),
+        cache: state.cache.clone(),
+        id_prefix: "img".to_string(),
+        model_name: state.config.model_name.clone(),
+        model_label: None,
+        model_request: None,
+        usage_reporter: make_usage_reporter(&auth, &state),
+        usage_type: UsageType::ImageGeneration,
+        request_hash: None,
+        response_transform,
+        chunk_transform: None,
+        backend_guard: target.backend_guard,
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: 0,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
+        response_shape: ResponseShape::ChatCompletion,
+        tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank: None,
+        admission: None,
+        connect_failover: None,
+        first_token_deadline: None,
+    };
+
+    proxy::proxy_multipart_request(target.client, &target.url, form, &request_sha256, opts).await
+}
+
+/// POST /v1/audio/transcriptions — multipart proxy with signing.
+pub async fn audio_transcriptions(
+    State(state): State<AppState>,
+    auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Response, AppError> {
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    let max_size = state.config.max_audio_request_size;
+    let mut form = reqwest::multipart::Form::new();
+    let mut total_size: usize = 0;
+    // Always hash the raw (original) bytes for signatures, matching the Python proxy.
+    // When encryption is active, the prompt field is hashed in its encrypted form,
+    // then decrypted for forwarding to the backend.
+    let mut hasher = sha2::Sha256::new();
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Invalid multipart: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        crate::model_list::guard_form_field_name(
+            super::ROUTE_AUDIO_TRANSCRIPTIONS,
+            &crate::model_list::AUDIO_TRANSCRIPTION_FORM_FIELDS,
+            &name,
+        )?;
+        let file_name = field.file_name().map(|s| s.to_string());
+        let content_type = field.content_type().map(|s| s.to_string());
+
+        if let (true, Some(ctx)) = (name == "prompt", enc_ctx.as_ref()) {
+            // Read field, hash the raw (encrypted) bytes, then decrypt for forwarding
+            let raw_data =
+                read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            let text = String::from_utf8(raw_data)
+                .map_err(|_| AppError::BadRequest("prompt field is not UTF-8".to_string()))?;
+            let data = if !text.is_empty() {
+                encryption::decrypt_string_for_field(&text, ctx, &state.signing, "prompt")?
+                    .into_bytes()
+            } else {
+                text.into_bytes()
+            };
+            let part = build_multipart_part(data, file_name, content_type)?;
+            form = form.part(name, part);
+        } else {
+            refuse_media_with_all_fields(
+                enc_ctx.as_ref(),
+                &name,
+                file_name.as_deref(),
+                content_type.as_deref(),
+            )?;
+            let data =
+                read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            crate::model_list::guard_form_field(&state, &name, &data)?;
+            guard_direct_form_model(&state, &name, &data, auth.cloud_api_key.is_some())?;
+            // Engine-internal fields are dropped (`request_guard.rs`). The hash above still binds what was sent.
+            if !state.config.request_guard.keep_form_field(&name, &data)? {
+                continue;
+            }
+            let part = build_multipart_part(data, file_name, content_type)?;
+            form = form.part(name, part);
+        }
+    }
+
+    let request_sha256 = hex::encode(hasher.finalize());
+
+    let response_transform = enc_ctx.as_ref().map(|ctx| {
+        encryption::make_response_transform(
+            Endpoint::AudioTranscriptions,
+            ctx.clone(),
+            state.signing.clone(),
+        )
+    });
+    let target = passthrough_target(
+        &state,
+        state.config.transcriptions_url_override.as_deref(),
+        "/v1/audio/transcriptions",
+    );
+
+    let opts = ProxyOpts {
+        signing: state.signing.clone(),
+        cache: state.cache.clone(),
+        id_prefix: "trans".to_string(),
+        model_name: state.config.model_name.clone(),
+        model_label: None,
+        model_request: None,
+        usage_reporter: make_usage_reporter(&auth, &state),
+        usage_type: UsageType::AudioTranscription,
+        request_hash: None,
+        response_transform,
+        chunk_transform: None,
+        backend_guard: target.backend_guard,
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: 0,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
+        response_shape: ResponseShape::ChatCompletion,
+        tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank: None,
+        admission: None,
+        connect_failover: None,
+        first_token_deadline: None,
+    };
+
+    proxy::proxy_multipart_request(target.client, &target.url, form, &request_sha256, opts).await
+}
+
+/// `/v1/images/generations` forwards only the keys in `IMAGE_GENERATION_FIELDS`.
+fn guard_image_generation_fields(
+    state: &AppState,
+    endpoint: Endpoint,
+    request_json: &serde_json::Value,
+) -> Result<(), AppError> {
+    if matches!(endpoint, Endpoint::ImagesGenerations) && state.config.request_guard.enabled {
+        crate::model_list::guard_json_field_names(
+            super::ROUTE_IMAGES_GENERATIONS,
+            &crate::model_list::IMAGE_GENERATION_FIELDS,
+            request_json,
+        )?;
+        state.config.request_guard.check_image_body(request_json)?;
+    }
+    Ok(())
+}
+
+/// Generic JSON passthrough with signing and optional encryption support.
+#[allow(clippy::too_many_arguments)]
+async fn json_passthrough_encrypted(
+    state: AppState,
+    body: Body,
+    pool_path: &str,
+    url_override: Option<&str>,
+    id_prefix: &str,
+    size_fn: fn(&crate::config::Config) -> usize,
+    usage_reporter: Option<UsageReporter>,
+    usage_type: UsageType,
+    tracing_ids: TracingIds,
+    enc_ctx: Option<encryption::EncryptionContext>,
+    endpoint: Endpoint,
+    direct_key: bool,
+) -> Result<Response, AppError> {
+    let max_size = size_fn(&state.config);
+    let request_body = read_body_with_limit(body, max_size).await?;
+
+    // Only embeddings take the adapter from the proxy (`lora_path`).
+    let with_lora = matches!(endpoint, Endpoint::Embeddings) && state.config.backend_lora.is_some();
+    // When encryption is active, decrypt fields and re-serialize.
+    // When inactive, validate JSON but forward the original bytes to
+    // preserve the exact request body for hashing, unless the adapter has to
+    // be set on it (the signature then still binds the body the client sent).
+    let (forward_body, original_request_hash, response_transform) = if let Some(ctx) = enc_ctx {
+        // Hash original client-sent body before decryption for signatures
+        let original_hash = hex::encode(sha2::Sha256::digest(&request_body));
+        let mut request_json = proxy::parse_json_object(&request_body)?;
+        validate_rerank_document_count(endpoint, &request_json)?;
+        encryption::decrypt_request_fields(&mut request_json, endpoint, &ctx, &state.signing)?;
+        guard_image_generation_fields(&state, endpoint, &request_json)?;
+        crate::model_list::guard_passthrough_body(&state, &request_json)?;
+        guard_direct_model(&state, &request_json, direct_key)?;
+        validate_image_count(endpoint, &request_json)?;
+        validate_rerank_document_count(endpoint, &request_json)?;
+        crate::forward_body::prepare(
+            &state.config,
+            crate::forward_body::Rules::Passthrough,
+            &mut request_json,
+        )
+        .await?;
+        if with_lora {
+            crate::model_list::apply_backend_lora(&state, &mut request_json);
+        }
+        let modified =
+            serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
+        let transform = encryption::make_response_transform(endpoint, ctx, state.signing.clone());
+        (modified, Some(original_hash), Some(transform))
+    } else {
+        let mut request_json = proxy::parse_json_object(&request_body)?;
+        validate_rerank_document_count(endpoint, &request_json)?;
+        guard_image_generation_fields(&state, endpoint, &request_json)?;
+        crate::model_list::guard_passthrough_body(&state, &request_json)?;
+        guard_direct_model(&state, &request_json, direct_key)?;
+        validate_image_count(endpoint, &request_json)?;
+        // The field rules and media inlining (`forward_body.rs`). A changed
+        // body is re-serialized, like the adapter below; otherwise the
+        // original bytes go through.
+        let changed = crate::forward_body::prepare(
+            &state.config,
+            crate::forward_body::Rules::Passthrough,
+            &mut request_json,
+        )
+        .await?;
+        if with_lora || changed {
+            let original_hash = hex::encode(sha2::Sha256::digest(&request_body));
+            if with_lora {
+                crate::model_list::apply_backend_lora(&state, &mut request_json);
+            }
+            let modified =
+                serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
+            (modified, Some(original_hash), None)
+        } else {
+            (request_body, None, None)
+        }
+    };
+
+    let target = passthrough_target(&state, url_override, pool_path);
+    let opts = ProxyOpts {
+        signing: state.signing.clone(),
+        cache: state.cache.clone(),
+        id_prefix: id_prefix.to_string(),
+        model_name: state.config.model_name.clone(),
+        model_label: None,
+        model_request: None,
+        usage_reporter,
+        usage_type,
+        request_hash: original_request_hash,
+        response_transform,
+        chunk_transform: None,
+        backend_guard: target.backend_guard,
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: 0,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
+        response_shape: ResponseShape::ChatCompletion,
+        tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank: None,
+        admission: None,
+        connect_failover: None,
+        first_token_deadline: None,
+    };
+
+    proxy::proxy_json_request(target.client, &target.url, forward_body, opts).await
+}
+
+fn guard_direct_model(
+    state: &AppState,
+    request: &serde_json::Value,
+    direct_key: bool,
+) -> Result<(), AppError> {
+    if direct_key && state.models.is_none() {
+        crate::model_list::guard_request_body(request, Some(&state.config.model_name))?;
+    }
+    Ok(())
+}
+
+fn guard_direct_form_model(
+    state: &AppState,
+    name: &str,
+    value: &[u8],
+    direct_key: bool,
+) -> Result<(), AppError> {
+    if direct_key
+        && state.models.is_none()
+        && name == "model"
+        && value != state.config.model_name.as_bytes()
+    {
+        return Err(AppError::ModelNotFound { model: None });
+    }
+    Ok(())
+}
+
+/// Keep the direct image endpoint aligned with the public API's 1..=10 range.
+/// The backend may silently truncate larger requests after allocating work.
+fn validate_image_count(endpoint: Endpoint, request: &serde_json::Value) -> Result<(), AppError> {
+    if !matches!(endpoint, Endpoint::ImagesGenerations) {
+        return Ok(());
+    }
+    let Some(value) = request.get("n").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    match value.as_i64() {
+        Some(1..=10) => Ok(()),
+        _ => Err(AppError::BadRequest(
+            "`n` must be an integer from 1 to 10".into(),
+        )),
+    }
+}
+
+/// Maximum number of documents accepted by one rerank request.
+pub const MAX_RERANK_DOCUMENTS: usize = 4096;
+
+fn validate_rerank_document_count(
+    endpoint: Endpoint,
+    request: &serde_json::Value,
+) -> Result<(), AppError> {
+    if !matches!(endpoint, Endpoint::Rerank) {
+        return Ok(());
+    }
+    let Some(count) = request
+        .get("documents")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+    else {
+        return Ok(());
+    };
+    if count > MAX_RERANK_DOCUMENTS {
+        return Err(AppError::BadRequest(format!(
+            "documents must contain at most {MAX_RERANK_DOCUMENTS} items, got {count}"
+        )));
+    }
+    Ok(())
+}
+
+/// Fixed client-facing message; it never includes a part's name, filename or type.
+const ENCRYPTED_MEDIA_UNSUPPORTED: &str =
+    "Media uploads are not supported with all-field encryption on this endpoint";
+
+/// Whether a multipart part (other than `prompt`) carries uploaded media rather
+/// than a plain form value: it has a filename, a non-text content type, or a
+/// media field name used by the image-edit and transcription APIs.
+fn is_media_part(name: &str, file_name: Option<&str>, content_type: Option<&str>) -> bool {
+    let non_text = content_type.is_some_and(|ct| {
+        let essence = ct.split(';').next().unwrap_or("").trim();
+        !essence.eq_ignore_ascii_case("text/plain")
+    });
+    file_name.is_some()
+        || non_text
+        || matches!(name, "image" | "mask" | "file")
+        || name.starts_with("image[")
+}
+
+/// Media parts are not encrypted on the multipart endpoints. When the client
+/// asked for all-field encryption, refuse the request from the part header,
+/// before its bytes are read and before anything is forwarded.
+fn refuse_media_with_all_fields(
+    enc_ctx: Option<&encryption::EncryptionContext>,
+    name: &str,
+    file_name: Option<&str>,
+    content_type: Option<&str>,
+) -> Result<(), AppError> {
+    let all_fields = enc_ctx.is_some_and(|ctx| ctx.all_fields());
+    if all_fields && is_media_part(name, file_name, content_type) {
+        return Err(AppError::BadRequest(
+            ENCRYPTED_MEDIA_UNSUPPORTED.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read a multipart field incrementally, enforcing the cumulative size limit and
+/// hashing the original bytes before any encrypted field is transformed.
+async fn read_field_chunks(
+    field: &mut Field<'_>,
+    total_size: &mut usize,
+    max_size: usize,
+    hasher: &mut sha2::Sha256,
+) -> Result<Vec<u8>, AppError> {
+    let mut data = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Error reading field: {e}")))?
+    {
+        *total_size = total_size.saturating_add(chunk.len());
+        if *total_size > max_size {
+            return Err(AppError::PayloadTooLarge { max_size });
+        }
+        hasher.update(&chunk);
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
+}
+
+/// Build a multipart part with optional filename and content type.
+fn build_multipart_part(
+    data: Vec<u8>,
+    file_name: Option<String>,
+    content_type: Option<String>,
+) -> Result<reqwest::multipart::Part, AppError> {
+    let mut part = reqwest::multipart::Part::bytes(data);
+    if let Some(fname) = file_name {
+        part = part.file_name(fname);
+    }
+    if let Some(ct) = content_type {
+        part = part
+            .mime_str(&ct)
+            .map_err(|_| AppError::BadRequest(format!("Invalid MIME type: {ct}")))?;
+    }
+    Ok(part)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_count_is_bounded_before_dispatch() {
+        for n in [1, 10] {
+            assert!(validate_image_count(
+                Endpoint::ImagesGenerations,
+                &serde_json::json!({"n": n}),
+            )
+            .is_ok());
+        }
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(11),
+            serde_json::json!(1.5),
+            serde_json::json!("2"),
+        ] {
+            assert!(validate_image_count(
+                Endpoint::ImagesGenerations,
+                &serde_json::json!({"n": value}),
+            )
+            .is_err());
+        }
+        assert!(validate_image_count(Endpoint::Embeddings, &serde_json::json!({"n": 32})).is_ok());
+    }
+
+    fn ctx(version: u8, encrypt_all_fields: bool) -> encryption::EncryptionContext {
+        encryption::EncryptionContext {
+            algo: encryption::EncryptionAlgo::Ed25519,
+            client_pub_key: vec![0; 32],
+            version,
+            encrypt_all_fields,
+        }
+    }
+
+    #[test]
+    fn media_parts_are_recognised_from_the_part_header() {
+        for (name, file_name, content_type) in [
+            ("image", None, None),
+            ("image[]", None, None),
+            ("image[0]", None, None),
+            ("mask", None, None),
+            ("file", None, None),
+            ("other", Some("synthetic.bin"), None),
+            ("other", None, Some("image/png")),
+            ("other", None, Some("application/octet-stream")),
+        ] {
+            assert!(is_media_part(name, file_name, content_type), "{name}");
+        }
+        for (name, content_type) in [
+            ("model", None),
+            ("response_format", None),
+            ("language", Some("text/plain")),
+            ("size", Some("Text/Plain; charset=utf-8")),
+        ] {
+            assert!(!is_media_part(name, None, content_type), "{name}");
+        }
+    }
+
+    #[test]
+    fn media_is_refused_only_with_all_field_encryption() {
+        let media = ("file", Some("synthetic.bin"), Some("audio/wav"));
+        let refuse = |enc: Option<&encryption::EncryptionContext>| {
+            refuse_media_with_all_fields(enc, media.0, media.1, media.2)
+        };
+        // No encryption, and v1/v2 without the all-field flag: unchanged.
+        assert!(refuse(None).is_ok());
+        assert!(refuse(Some(&ctx(1, false))).is_ok());
+        assert!(refuse(Some(&ctx(2, false))).is_ok());
+        // All-field mode in every version.
+        for enc in [ctx(1, true), ctx(2, true), ctx(3, false), ctx(3, true)] {
+            match refuse(Some(&enc)) {
+                Err(AppError::BadRequest(message)) => {
+                    assert_eq!(message, ENCRYPTED_MEDIA_UNSUPPORTED);
+                    assert!(!message.contains("synthetic.bin"));
+                }
+                other => panic!("v{}: unexpected {other:?}", enc.version),
+            }
+        }
+        // Plain form values are still accepted in all-field mode.
+        assert!(refuse_media_with_all_fields(Some(&ctx(1, true)), "model", None, None).is_ok());
+    }
+}

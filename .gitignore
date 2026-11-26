@@ -1,0 +1,6 @@
+/target
+.GIT_REV
+oci.tar
+.DS_Store
+*.resolved.txt
+*.log

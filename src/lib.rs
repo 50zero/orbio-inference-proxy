@@ -1,0 +1,103 @@
+use std::sync::Arc;
+
+pub mod admission;
+pub mod agent_loop;
+pub mod api_key_cache;
+pub mod attestation;
+pub mod attestation_sdk;
+pub mod auth;
+mod aws_credentials;
+pub mod backend_affinity;
+pub mod backend_pool;
+pub mod cache;
+pub mod cache_salt;
+pub mod config;
+pub mod content_policy;
+pub mod context_tier;
+pub mod direct_deprecation;
+pub mod encryption;
+pub mod engine_load;
+pub mod error;
+pub mod forward_body;
+pub mod gpu_evidence_delegate;
+pub mod image_validation;
+pub mod media_inline;
+pub mod media_refs;
+pub mod metrics_middleware;
+pub mod model_list;
+pub mod model_metrics;
+pub mod ohttp_gateway;
+pub mod priority;
+pub mod proxy;
+pub mod rate_limit;
+pub mod reasoning;
+pub mod replica_state;
+pub mod request_guard;
+pub mod request_log;
+pub mod request_tracing;
+pub mod rerank_limit;
+pub mod response_format;
+pub mod routes;
+pub mod signing;
+pub mod startup_checks;
+pub mod structured_regex;
+pub mod system_messages;
+pub mod tool_calls;
+pub mod types;
+pub mod usage_report;
+pub mod vllm_dp_affinity;
+
+pub use request_tracing::{request_id_middleware, RequestStart, TracingIds};
+
+/// Shared application state available to all handlers.
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<config::Config>,
+    pub signing: Arc<signing::SigningPair>,
+    pub cache: Arc<cache::ChatCache>,
+    pub attestation_cache: Arc<attestation::AttestationCache>,
+    pub http_client: reqwest::Client,
+    /// Client for requests to the inference backends. Identical to
+    /// `http_client` unless `VLLM_BACKEND_TOKEN` or `VLLM_BACKEND_PRIORITY`
+    /// is set, in which case it carries `Authorization: Bearer <token>` and/or
+    /// `X-NearAI-Priority: <n>` by default so those only ever reach backends —
+    /// never cloud-api or other services.
+    pub backend_client: reqwest::Client,
+    pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    /// Live SHA-256 hash of the TLS certificate's SPKI (Subject Public Key
+    /// Info). The tracker re-stats the cert on every attestation-cache
+    /// refresh tick and re-hashes when `mtime` advances, so a certbot-driven
+    /// rotation in the co-located ingress sidecar is picked up automatically
+    /// without restarting the proxy. Routes call `.current()` on the hot path.
+    pub tls_cert_fingerprint: Arc<attestation::TlsCertTracker>,
+    pub backend_pool: Arc<backend_pool::BackendPool>,
+    pub ohttp_gateway: Option<Arc<ohttp_gateway::OhttpGateway>>,
+    pub ohttp_attestation_ed25519: Option<types::OhttpAttestation>,
+    pub vllm_dp_affinity: Arc<vllm_dp_affinity::VllmDpAffinity>,
+    /// Conversation → backend pinning across `backend_pool` (see
+    /// `VLLM_BACKEND_CONVERSATION_AFFINITY`). Inactive with one backend.
+    pub backend_affinity: Arc<backend_affinity::BackendConversationAffinity>,
+    /// Lane admission: in-flight budget, per-host share and overload refusal
+    /// for chat/completions (gateway mode, `VLLM_PROXY_ADMISSION_*`). Inert
+    /// unless configured.
+    pub admission: Arc<admission::AdmissionController>,
+    /// Gateway list mode (`VLLM_PROXY_MODEL_LIST_FILE`, `model_list.rs`):
+    /// the served models, each with its own backend client, pool, affinity
+    /// and admission. `None` = the process serves one model and
+    /// `backend_client`, `backend_pool`, `backend_affinity` and `admission`
+    /// above are that model's. With a list those four are the inert
+    /// single-model defaults (no bearer, an unroutable backend, admission
+    /// off): chat/completions go through `model_list::model_for`, and the
+    /// routes that read them directly are not served.
+    pub models: Option<Arc<model_list::ModelList>>,
+    /// Delivery of usage reports to cloud-api, off the request path
+    /// (`usage_report.rs`, `VLLM_PROXY_USAGE_REPORT_*`). One per process,
+    /// shared by every model of a list.
+    pub usage_report_delivery: Arc<usage_report::UsageReportDelivery>,
+    /// Coalesces concurrent cloud-api checks for the same `sk-` key.
+    /// One per process, shared by every model of a list.
+    pub api_key_cache: Arc<api_key_cache::ApiKeyCache>,
+    /// In-flight limit for `/v1/rerank` (`rerank_limit.rs`): per workspace
+    /// for Cloud API keys, one shared pool for config tokens.
+    pub rerank_limiter: Arc<rerank_limit::RerankLimiter>,
+}

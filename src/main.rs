@@ -1,0 +1,534 @@
+use std::sync::Arc;
+
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use tokio::net::TcpListener;
+use tracing::info;
+use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
+use vllm_proxy_rs::{
+    admission, attestation, backend_affinity, backend_pool, cache, config, engine_load,
+    metrics_middleware, model_list, routes, signing, startup_checks, usage_report,
+    vllm_dp_affinity, AppState,
+};
+
+/// DNS resolver that returns only IPv4 addresses.
+///
+/// reqwest 0.12 made hickory-dns mandatory. Hickory fires A+AAAA in parallel
+/// and returns a hard error when the AAAA query comes back NOERROR with no
+/// records (which QEMU SLIRP does for IPv4-only domains like cloud-api.near.ai),
+/// without falling back to the A result. The system resolver (getaddrinfo via
+/// tokio) handles this correctly.
+struct Ipv4OnlyResolver;
+
+impl Resolve for Ipv4OnlyResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(async move {
+            let v4: Vec<_> = tokio::net::lookup_host(format!("{}:0", name.as_str()))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .filter(|a| a.is_ipv4())
+                .collect();
+            if v4.is_empty() {
+                tracing::warn!(domain = %name.as_str(), "DNS returned no IPv4 addresses");
+            }
+            Ok(Box::new(v4.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// An HTTP client with the process's connection-pool and timeout settings and,
+/// for a backend-only client, the default headers it carries.
+///
+/// pool_idle_timeout must be shorter than upstream keepalive_timeout
+/// (typically 75s on nginx) to avoid reusing connections the server has
+/// closed. A reused-but-closed connection surfaces as
+/// `error sending request for url ...` and produced ~12 spurious 401s/h
+/// on `/v1/check_api_key` before we capped this. (See auth.rs retry path.)
+fn build_http_client(
+    config: &config::Config,
+    default_headers: Option<reqwest::header::HeaderMap>,
+) -> reqwest::Result<reqwest::Client> {
+    let mut http_builder = reqwest::Client::builder()
+        .dns_resolver(Arc::new(Ipv4OnlyResolver))
+        .pool_max_idle_per_host(config.max_keepalive)
+        .timeout(std::time::Duration::from_secs(config.timeout_secs));
+    if config.pool_idle_timeout_secs > 0 {
+        http_builder = http_builder.pool_idle_timeout(std::time::Duration::from_secs(
+            config.pool_idle_timeout_secs,
+        ));
+    }
+    if let Some(headers) = default_headers {
+        http_builder = http_builder.default_headers(headers);
+    }
+    http_builder.build()
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialize tracing
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let json_logs = std::env::var("LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if json_logs {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
+
+    // Load config
+    let mut config = config::Config::from_env()?;
+    let gpu_arch = attestation::configured_gpu_arch().map_err(anyhow::Error::msg)?;
+    let gpu_count = attestation::configured_gpu_count().map_err(anyhow::Error::msg)?;
+    info!(%gpu_arch, gpu_count, "GPU attestation target");
+    // Decided once, before anything is built on it: a usage queue that fails
+    // its startup check leaves the process on the HTTP transport when that is
+    // configured, and refuses startup when it is not.
+    let resolved = usage_report::UsageReportDelivery::resolve_transport(
+        config.usage_report.clone(),
+        config.usage_report_transport.clone(),
+        config.cloud_api_url.is_some() && config.cloud_api_usage_token.is_some(),
+    )
+    .await?;
+    let fell_back = config.adopt_usage_transport(resolved)?;
+
+    let listen_port = config.listen_port;
+    let listen_addr = config.listen_addr.clone();
+
+    // Warn if any backend URL points to the proxy's own listen address
+    let self_local = format!("://localhost:{listen_port}");
+    let self_ip = format!("://127.0.0.1:{listen_port}");
+    // Gateway list mode: every model's backends, which are then the only ones.
+    let listed_models = config
+        .model_list
+        .as_ref()
+        .map_or(&[][..], |list| list.models.as_slice());
+    for url in config
+        .backend_urls
+        .iter()
+        .chain(&config.backend_long_context_urls)
+        .chain(listed_models.iter().flat_map(|model| {
+            model
+                .backend_urls
+                .iter()
+                .chain(&model.backend_long_context_urls)
+        }))
+    {
+        let backend_base = url.trim_end_matches('/');
+        if backend_base.contains(&self_local) || backend_base.contains(&self_ip) {
+            tracing::warn!(
+                listen_port,
+                "Backend URL points to the proxy's own listen port. \
+                 Set VLLM_BASE_URL/VLLM_BACKEND_URLS to the actual backend address or change LISTEN_PORT."
+            );
+        }
+    }
+
+    match &config.model_list {
+        Some(list) => info!(
+            models = ?list.models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            listed_models = ?list.listed.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            model_list_file = %list.path,
+            listen_port,
+            dev_mode = config.dev_mode,
+            "Starting vllm-proxy-rs"
+        ),
+        None => info!(
+            model = %config.model_name,
+            backend_count = config.backend_urls.len(),
+            listen_port,
+            dev_mode = config.dev_mode,
+            "Starting vllm-proxy-rs"
+        ),
+    }
+
+    // Initialize signing keys
+    let signing = signing::SigningPair::init(&config.model_name, config.dev_mode).await?;
+    info!(
+        ecdsa_address = %signing.ecdsa.signing_address,
+        ed25519_address = %signing.ed25519.signing_address,
+        "Signing keys ready"
+    );
+
+    // Gateway list mode: the whole state is built by the library, in the
+    // function the tests start a gateway with (`model_list::app_state`), and
+    // served like any other. Nothing below this block runs for a list: it
+    // builds, checks and attests the one model of a single-model process,
+    // and a list is refused at startup next to what would need it (OHTTP, a
+    // TEE, the compatibility check, replica state).
+    if config.model_list.is_some() {
+        let config = Arc::new(config);
+        let state = model_list::app_state(model_list::Process {
+            config: config.clone(),
+            signing,
+            http_client: build_http_client(&config, None)?,
+            metrics_handle: metrics_middleware::setup_metrics_recorder(),
+            backend_client: &|headers| Ok(build_http_client(&config, Some(headers))?),
+        })?;
+        if fell_back {
+            usage_report::record_fallback_to_http();
+        }
+        return serve(state, &listen_addr, listen_port).await;
+    }
+
+    // Track the TLS certificate's SPKI hash. The tracker seeds itself from
+    // disk at startup, then the background attestation cache refresh task
+    // re-stats the cert on every tick and picks up renewals automatically.
+    let tls_cert_fingerprint = Arc::new(attestation::TlsCertTracker::new(
+        config.tls_cert_path.clone(),
+    )?);
+
+    // Initialize OHTTP gateway if enabled
+    let ohttp_gw = if config.ohttp_enabled {
+        let gw = OhttpGateway::new(signing.ed25519.secret_bytes())?;
+        info!(
+            ohttp_key_config = %hex::encode(gw.config_bytes()),
+            "OHTTP Gateway enabled"
+        );
+        Some(Arc::new(gw))
+    } else {
+        None
+    };
+    let ohttp_attestation_ed25519 = ohttp_gw
+        .as_ref()
+        .map(|gw| attestation::build_ohttp_attestation(&signing, gw))
+        .transpose()?;
+
+    // Initialize caches
+    let chat_cache = cache::ChatCache::new(&config.model_name, config.chat_cache_expiration_secs);
+    let vllm_dp_affinity = Arc::new(vllm_dp_affinity::VllmDpAffinity::new(
+        config.vllm_data_parallel_size,
+        config.chat_cache_expiration_secs,
+    ));
+    let backend_count = config.backend_urls.len() + config.backend_long_context_urls.len();
+    let backend_affinity = Arc::new(backend_affinity::BackendConversationAffinity::new(
+        config.backend_conversation_affinity,
+        backend_count,
+        config.backend_affinity_max_imbalance,
+        config.chat_cache_expiration_secs,
+    ));
+    if backend_affinity.is_active() {
+        info!(
+            backends = backend_count,
+            max_imbalance = config.backend_affinity_max_imbalance,
+            "Backend conversation affinity enabled"
+        );
+    } else if config.backend_conversation_affinity {
+        info!("VLLM_BACKEND_CONVERSATION_AFFINITY set but only one backend is configured; nothing to pin");
+    }
+    let attestation_cache = Arc::new(attestation::AttestationCache::with_max_inflight(
+        config.attestation_cache_ttl_secs,
+        config.attestation_max_inflight,
+    ));
+
+    // Initialize HTTP client with connection pooling.
+    let http_client = build_http_client(&config, None)?;
+    // Backend-only client: carries the backend bearer and the priority header
+    // (if any) as default headers so they can never be attached to a cloud-api
+    // or registry request.
+    let mut backend_headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = &config.backend_token {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| anyhow::anyhow!("VLLM_BACKEND_TOKEN is not a valid header value"))?;
+        value.set_sensitive(true);
+        backend_headers.insert(reqwest::header::AUTHORIZATION, value);
+        info!("Backend requests will carry the configured VLLM_BACKEND_TOKEN");
+    }
+    if let Some(priority) = config.backend_priority {
+        backend_headers.insert(
+            vllm_proxy_rs::priority::PRIORITY_HEADER,
+            reqwest::header::HeaderValue::from(priority),
+        );
+        info!(priority, "Backend requests will carry the priority header");
+    }
+    let backend_client = if backend_headers.is_empty() {
+        http_client.clone()
+    } else {
+        build_http_client(&config, Some(backend_headers))?
+    };
+
+    // Initialize metrics
+    let metrics_handle = metrics_middleware::setup_metrics_recorder();
+
+    // Initialize backend pool: the long-context tier, when configured, sits
+    // after the base backends so their indexes never move.
+    let backend_pool = Arc::new(backend_pool::BackendPool::with_long_context(
+        config.backend_urls.clone(),
+        config.backend_long_context_urls.clone(),
+    ));
+    if !config.backend_long_context_urls.is_empty() {
+        info!(
+            backends = config.backend_long_context_urls.len(),
+            above_tokens = config.long_context_above_tokens,
+            "Long-context tier enabled"
+        );
+    }
+    if config.first_token_deadline_ms > 0 {
+        info!(
+            deadline_ms = config.first_token_deadline_ms,
+            per_1k_tokens_ms = config.first_token_deadline_per_1k_tokens_ms,
+            max_ms = config.first_token_deadline_max_ms,
+            "Streaming requests are refused when the first token misses their deadline"
+        );
+    }
+
+    // Replica state publishing (opt-in): one signed host frame per tick to Redis.
+    if let Some(rs) = config.replica_state() {
+        info!(
+            host_id = %rs.host_id,
+            interval_ms = rs.interval.as_millis() as u64,
+            redis = %rs.redis_host_for_logs(),
+            "Publishing replica state to Redis"
+        );
+        vllm_proxy_rs::replica_state::spawn_replica_state_publisher(
+            rs.clone(),
+            backend_pool.clone(),
+            backend_client.clone(),
+            config.dev_mode || config.non_tee_deployment,
+        );
+    }
+
+    // Live engine load per backend (gateway mode): polled when probe URLs are
+    // configured; a sample older than three intervals counts as unknown.
+    let probe_interval = std::time::Duration::from_secs(config.backend_probe_interval_secs);
+    let engine_load = Arc::new(engine_load::EngineLoad::new(
+        backend_pool.len(),
+        probe_interval * 3,
+    ));
+    let probe_urls = config.pool_probe_urls();
+    if !probe_urls.is_empty() {
+        info!(
+            backends = probe_urls.len(),
+            interval_secs = config.backend_probe_interval_secs,
+            "Polling engine load from the backends' metrics"
+        );
+        engine_load::spawn_engine_load_poller(
+            engine_load.clone(),
+            http_client.clone(),
+            probe_urls,
+            probe_interval,
+        );
+    }
+
+    // Lane admission (gateway mode): inert unless configured.
+    let admission = Arc::new(admission::AdmissionController::new(
+        config.admission(),
+        backend_pool.len(),
+        engine_load,
+    ));
+    if let Some(settings) = admission.config() {
+        info!(
+            max_inflight = settings.max_inflight,
+            start_inflight = settings.start_inflight,
+            long_reserved_inflight = settings.long_reserved_inflight,
+            ramp_step = settings.ramp_step,
+            ramp_interval_secs = settings.ramp_interval.as_secs(),
+            ttft_p95_max_ms = settings.ttft_p95_max.map_or(0, |d| d.as_millis()),
+            backpressure_secs = settings.backpressure_ttl.as_secs(),
+            queue_saturated_at = settings.queue_saturated_at,
+            retry_after_secs = settings.retry_after.as_secs(),
+            "Lane admission enabled"
+        );
+    }
+    if config.backend_connect_failover {
+        info!("Connection fail-over to another backend enabled for chat/completions");
+    }
+    if let Some(bound) = config.backend_max_inflight {
+        info!(
+            bound,
+            "Requests in flight bounded per backend; refusing with 429 when every backend is full"
+        );
+    }
+
+    // Build app state
+    let model_name = config.model_name.clone();
+    let state = AppState {
+        api_key_cache: Default::default(),
+        rerank_limiter: Arc::new(vllm_proxy_rs::rerank_limit::RerankLimiter::new(
+            config.rerank_limits,
+        )),
+        usage_report_delivery: usage_report::UsageReportDelivery::for_transport(
+            config.usage_report.clone(),
+            &config.usage_report_transport,
+        ),
+        config: Arc::new(config),
+        signing: Arc::new(signing),
+        cache: Arc::new(chat_cache),
+        attestation_cache: attestation_cache.clone(),
+        http_client,
+        backend_client,
+        metrics_handle,
+        tls_cert_fingerprint: tls_cert_fingerprint.clone(),
+        backend_pool: backend_pool.clone(),
+        ohttp_gateway: ohttp_gw,
+        ohttp_attestation_ed25519: ohttp_attestation_ed25519.clone(),
+        vllm_dp_affinity,
+        backend_affinity,
+        admission,
+        models: None,
+    };
+
+    // Spawn background attestation cache refresh task.
+    // Refresh interval is half the TTL to ensure the cache never goes stale.
+    let compose_manager =
+        state
+            .config
+            .compose_manager_url
+            .as_ref()
+            .map(|url| attestation::ComposeManagerConfig {
+                http_client: state.http_client.clone(),
+                url: url.clone(),
+            });
+    let delegate_refresh = state.config.gpu_evidence_delegate_url.as_ref().map(|_| {
+        attestation::DelegateRefreshConfig {
+            config: state.config.clone(),
+            http_client: state.http_client.clone(),
+        }
+    });
+    if state.config.non_tee_deployment {
+        // Non-TEE deployment (gateway mode): no dstack guest agent, so there is
+        // nothing to attest and the periodic refresh would only log failures.
+        info!("dstack not available on this deployment; attestation cache refresh disabled");
+    } else {
+        attestation::spawn_cache_refresh_task(
+            attestation_cache,
+            model_name,
+            state.signing.clone(),
+            state.config.gpu_no_hw_mode,
+            tls_cert_fingerprint,
+            state.config.attestation_cache_ttl_secs / 2,
+            compose_manager,
+            ohttp_attestation_ed25519,
+            delegate_refresh,
+        );
+    }
+
+    // Run OpenAI chat compatibility checks if enabled
+    if state.config.openai_chat_compatibility_check_enabled {
+        info!("OpenAI chat compatibility check enabled, verifying backend...");
+        if let Err(e) =
+            startup_checks::run_startup_checks(&state.backend_client, &state.config).await
+        {
+            let error_kind = match &e {
+                startup_checks::StartupCheckError::ConnectionFailed { .. } => "connection_failed",
+                startup_checks::StartupCheckError::UnexpectedStatus { .. } => "unexpected_status",
+                startup_checks::StartupCheckError::ModelNotFound { .. } => "model_not_found",
+                startup_checks::StartupCheckError::ChatCompletionFailed { .. } => {
+                    "chat_completion_failed"
+                }
+                startup_checks::StartupCheckError::RetriesExhausted { .. } => "retries_exhausted",
+            };
+            tracing::error!(
+                error_kind,
+                "OpenAI chat compatibility check failed — exiting"
+            );
+            return Err(anyhow::anyhow!("Startup checks failed: {error_kind}"));
+        }
+    } else {
+        info!("OpenAI chat compatibility check disabled (set OPENAI_CHAT_COMPATIBILITY_CHECK=true to enable)");
+    }
+
+    // Spawn backend health checks if multiple backends
+    if backend_pool.len() > 1 {
+        info!(
+            backends = backend_pool.len(),
+            interval_secs = state.config.health_check_interval_secs,
+            max_failures = state.config.health_check_max_failures,
+            health_path = %state.config.backend_health_path,
+            "Spawning backend health checker"
+        );
+        backend_pool::spawn_health_check(
+            backend_pool,
+            state.http_client.clone(),
+            std::time::Duration::from_secs(state.config.health_check_interval_secs),
+            std::time::Duration::from_secs(state.config.health_check_timeout_secs),
+            state.config.health_check_max_failures,
+            &state.config.backend_health_path,
+        );
+    }
+
+    if fell_back {
+        usage_report::record_fallback_to_http();
+    }
+    serve(state, &listen_addr, listen_port).await
+}
+
+/// Serve `state` on the listen address until a shutdown signal.
+async fn serve(state: AppState, listen_addr: &str, listen_port: u16) -> anyhow::Result<()> {
+    info!(
+        per_second = state.config.rate_limit_per_second,
+        burst = state.config.rate_limit_burst_size,
+        trust_proxy_headers = state.config.rate_limit_trust_proxy_headers,
+        "Rate limiter configured"
+    );
+
+    // The routes for this state behind the rate limiter, the request id and
+    // the HTTP metrics.
+    let usage_report_delivery = state.usage_report_delivery.clone();
+    let app = routes::build_app(state);
+
+    // Bind and serve
+    // Bind from the parsed address so an IPv6 `LISTEN_ADDR` gets its brackets.
+    let ip: std::net::IpAddr = listen_addr
+        .parse()
+        .map_err(|_| anyhow::anyhow!("LISTEN_ADDR must be an IP address"))?;
+    let addr = std::net::SocketAddr::new(ip, listen_port);
+    let listener = TcpListener::bind(addr).await?;
+    info!("Listening on {addr}");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // The server has stopped: every open request has ended, however long
+    // that took. Only now do the usage reports still pending get their time
+    // (`VLLM_PROXY_USAGE_REPORT_*`; by default nothing is awaited, as before).
+    let _ = usage_report_delivery.drain_at_shutdown().await;
+
+    info!("Server shut down");
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("Shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn ipv4_only_resolver_filters_out_ipv6() {
+        let r = Ipv4OnlyResolver;
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        let addrs: Vec<_> = r.resolve(name).await.unwrap().collect();
+        assert!(!addrs.is_empty(), "localhost should resolve");
+        assert!(addrs.iter().all(|a| a.is_ipv4()), "got non-IPv4: {addrs:?}");
+    }
+}

@@ -1,0 +1,481 @@
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::response::Response;
+use axum::Extension;
+
+use sha2::Digest;
+
+use crate::agent_loop;
+use crate::auth::RequireAuth;
+use crate::backend_affinity::parse_replica_hint;
+use crate::encryption::{self, Endpoint};
+use crate::error::AppError;
+use crate::model_metrics::ModelRequest;
+use crate::proxy::{self, make_usage_reporter_for, ProxyOpts, ResponseShape, UsageType};
+use crate::routes::completion_placement::place_completion;
+use crate::routes::ROUTE_CHAT_COMPLETIONS;
+use crate::{AppState, RequestStart, TracingIds};
+
+/// POST /v1/chat/completions
+pub async fn chat_completions(
+    State(state): State<AppState>,
+    auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
+    request_start: Option<Extension<RequestStart>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
+    // Gateway list mode counts the response under the model `serve` resolves
+    // (`model_metrics::count_response`). With one model this stays `None`
+    // and the result goes out untouched.
+    let mut counted_as = None;
+    let result = serve(
+        state,
+        auth,
+        tracing_ids,
+        request_start,
+        headers,
+        body,
+        &mut counted_as,
+    )
+    .await;
+    crate::model_metrics::count_response(counted_as, result)
+}
+
+async fn serve(
+    state: AppState,
+    auth: RequireAuth,
+    tracing_ids: TracingIds,
+    request_start: Option<Extension<RequestStart>>,
+    headers: HeaderMap,
+    body: Body,
+    counted_as: &mut Option<ModelRequest>,
+) -> Result<Response, AppError> {
+    let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
+
+    let mut request_json = proxy::parse_json_object(&request_body)?;
+    // On the direct `sk-` path the backend assigns its own id. Trusted
+    // gateway traffic is unaffected.
+    if auth.cloud_api_key.is_some() {
+        proxy::strip_client_request_ids(&mut request_json);
+    }
+
+    // The model this request is served as: the process's one model, or, in
+    // gateway list mode, the entry the body's `model` names (404 otherwise).
+    // After authentication, before anything model-specific.
+    let model = crate::model_list::model_for(&state, &request_json)?;
+    *counted_as = ModelRequest::of(model.label, ROUTE_CHAT_COMPLETIONS);
+
+    // Strip empty tool_calls (vLLM bug workaround)
+    strip_empty_tool_calls(&mut request_json);
+
+    // Engine `priority`: the proxy decides it (trusted callers may set it via
+    // header; any client value is discarded). Before any branch so the agent
+    // loop inherits it.
+    crate::priority::apply_priority(
+        &mut request_json,
+        &headers,
+        auth.cloud_api_key.is_none(),
+        state.config.priority_lower_first,
+    );
+    // Engine prompt-cache namespace: set by the proxy for an `sk-` caller
+    // (bound to its organization and workspace), left as sent by a trusted
+    // caller. Before any branch so the agent loop inherits it.
+    crate::cache_salt::apply(&mut request_json, &auth)?;
+    // Gateway mode: an aggregator's `reasoning` object becomes the engine's
+    // `reasoning_effort` switch (`enabled: false` → `none`), otherwise the
+    // model keeps thinking and the caller pays for it.
+    if model.trusted_by_backends {
+        crate::reasoning::apply_reasoning_switch(&mut request_json, model.reasoning_off_effort);
+        // List mode: the efforts this model's engine refuses become the ones
+        // configured for it (`reasoning_effort_map`), on what the switch left.
+        // A model with a map always has a backend token (`model_list`).
+        if let Some(map) = model.reasoning_effort_map {
+            crate::reasoning::apply_effort_map(&mut request_json, map, model.label);
+        }
+    }
+
+    // Extract encryption context from headers
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    if let Some(ref ctx) = enc_ctx {
+        // 421 before decryption or any generation when the gateway pinned
+        // a different model key.
+        encryption::require_model_pub_key(&headers, ctx, &state.signing)?;
+    }
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
+
+    // Request hash for signing: SHA256(wire body) by default. X-Request-Hash is only
+    // honored when authenticated with config.token (trusted gateway); sk- clients
+    // always bind signatures to the wire body so they cannot forge a hash for a
+    // different payload.
+    let request_hash =
+        resolve_request_hash_for_signing(&headers, &request_body, auth.cloud_api_key.is_none());
+
+    // Decrypt request fields if encryption is active
+    if let Some(ref ctx) = enc_ctx {
+        encryption::decrypt_request_fields(
+            &mut request_json,
+            Endpoint::ChatCompletions,
+            ctx,
+            &state.signing,
+        )?;
+    }
+    // The model and adapter checks, on the body as it will be forwarded: the
+    // decrypted fields are in it now.
+    crate::model_list::guard_request_body(
+        &request_json,
+        if auth.cloud_api_key.is_some() {
+            Some(model.id)
+        } else {
+            crate::model_list::checked_model(&state, model.id)
+        },
+    )?;
+    crate::model_list::apply_backend_lora(&state, &mut request_json);
+    // First half of `forward_body::prepare`: bounds on sampling fields,
+    // `model` and content parts, and engine-internal fields stripped
+    // (`request_guard.rs`). On the decrypted body, before anything below
+    // reads it. Media inlining runs after the admission precheck below.
+    state
+        .config
+        .request_guard
+        .apply_completion_body(&mut request_json)?;
+
+    // Repair tool-call `arguments` the engine would refuse (empty, missing,
+    // double-encoded, non-object): one odd historical turn must not 400 the
+    // whole conversation. After decryption, so an encrypted field is judged
+    // on its plaintext, never on the ciphertext. See nearai/inference-proxy#239.
+    crate::tool_calls::normalize_tool_call_arguments(&mut request_json);
+    // Same idea for structured outputs: a `json_schema` without the required
+    // `name` (or a bare schema with no wrapper) is a pydantic 400 on SGLang
+    // that other providers accept, so the whole request fails only with us.
+    // Every lane, not just the gateway: cloud-api forwards `response_format`
+    // verbatim. See nearai/inference-proxy#279.
+    crate::response_format::repair_json_schema_response_format(&mut request_json);
+
+    // Reject clearly-bad image inputs (unfetchable / non-image) before forwarding
+    // to the engine, so a flood of dead URLs can't load the model. Runs only when
+    // the request actually contains images; conservative/fail-open otherwise.
+    // See nearai/infra#159, #172.
+    // Refuse modalities this deployment does not serve (e.g. video) with a
+    // deterministic 400 before anything is fetched or dispatched.
+    crate::content_policy::reject_unsupported_content_parts(
+        &request_json,
+        &state.config.rejected_content_part_types,
+    )?;
+    // List mode: a model whose chat template takes one `system` message,
+    // first, gets a request's system messages merged into that
+    // (`merge_system_messages`). After decryption, the two repairs and the
+    // content policy above, which all read the messages as the caller sent
+    // them. Before everything below: the estimate, the tier, admission and
+    // the affinity keys describe the body that is dispatched.
+    if model.merge_system_messages {
+        crate::system_messages::merge_system_messages(&mut request_json, model.label);
+    }
+    // Size bonus on the engine `priority`: needs the plaintext prompt, so it
+    // runs here (after decryption and the repairs) and before every branch
+    // that forwards the body: the agent loop and the plain proxy path.
+    if let Some(tiers) = &state.config.priority_size_tiers {
+        crate::priority::apply_size_bonus(
+            &mut request_json,
+            tiers,
+            crate::priority::BodyKind::Chat,
+            state.config.priority_lower_first,
+        );
+    }
+    let is_stream = request_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // The input estimate the long-context tier routes on. Not free — it
+    // re-serializes the tool definitions and the tool calls in the history —
+    // so it is walked at most once per request and only where it is read.
+    let estimate = (model.long_context_above_tokens > 0)
+        .then(|| crate::context_tier::chat_estimate(&request_json));
+    // Long-context tier (gateway mode): a request whose estimated input is
+    // above the threshold belongs on the long-context backends, and every
+    // candidate selection below is restricted to its tier. `tier` is `None`
+    // only when the feature itself is off (`long_context_above_tokens == 0`).
+    // An empty tier is folded into `TierDecision.restrict` instead: lifted to
+    // `None` there so the request falls back to the other tier (default), or
+    // pinned `Some` so it is refused later (`VLLM_BACKEND_TIER_STRICT`). See
+    // `context_tier.rs`.
+    let tier = crate::context_tier::decide(
+        model.backend_pool,
+        model.long_context_above_tokens,
+        model.backend_tier_strict,
+        || estimate.unwrap_or_else(|| crate::context_tier::chat_estimate(&request_json)),
+    );
+    // Lane admission (gateway mode), first half: the overload and budget
+    // checks, so a request the lane cannot take is refused before any image
+    // is fetched. The slot and the backend placement are taken on the normal
+    // proxy path below, after the special branches, right before dispatch.
+    model.admission.precheck(model.backend_pool, tier)?;
+    // Same conversation digest, applied across independent backends: later
+    // turns follow the backend that already holds this conversation's prefix.
+    let backend_affinity_key = model
+        .backend_affinity
+        .key_for_chat_request(&request_json, model.id);
+
+    // Second half of `forward_body::prepare` (the field rules ran above):
+    // download remote images/audio here and forward `data:` URLs, so the
+    // engine never needs the network (fail closed, off unless
+    // VLLM_PROXY_INLINE_MEDIA=1). Before validation, which then only sees
+    // local `data:` URLs.
+    crate::media_inline::inline_remote_media(&mut request_json, &state.config.media_inline())
+        .await?;
+    crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
+        .await?;
+
+    // Server-side agent loop opt-in: the request advertises exactly
+    // `{"type":"web_context_search"}` and nothing else. Requires streaming
+    // (we splice tool-result chunks between iterations) and Brave creds
+    // configured on this CVM. Anything that doesn't match falls through to
+    // the existing pass-through path below, byte-for-byte identical.
+    if agent_loop::is_web_context_search_request(&request_json) {
+        if !is_stream {
+            return Err(AppError::BadRequest(
+                "web_context_search requires stream:true".to_string(),
+            ));
+        }
+        let count =
+            agent_loop::web_context_search_count(&request_json).map_err(AppError::BadRequest)?;
+        if state.config.web_context_search_url.is_none()
+            || state.config.web_context_search_api_key.is_none()
+        {
+            return Err(AppError::BadRequest(
+                "web_context_search is not configured on this deployment".to_string(),
+            ));
+        }
+
+        // Build chunk transform if E2EE is active. The agent loop is the
+        // privacy-critical path — both our synthetic `nearai_tool_result`
+        // chunks AND the model's own `tool_calls[].function.{name,arguments}`
+        // (which contain the search query the model just generated from the
+        // user's E2EE-decrypted prompt) must travel encrypted. Force
+        // `encrypt_all_fields: true` on the context used to build this
+        // transform so clients don't need to remember to send
+        // `X-Encrypt-All-Fields: true` to get the full privacy guarantee.
+        // This only affects the agent-loop path; the regular chat path
+        // below still honors the client's `X-Encrypt-All-Fields` choice.
+        let chunk_transform = enc_ctx.map(|mut ctx| {
+            ctx.encrypt_all_fields = true;
+            encryption::make_chunk_transform(Endpoint::ChatCompletions, ctx, state.signing.clone())
+        });
+        return agent_loop::run_chat_completion(
+            state,
+            auth,
+            tracing_ids,
+            request_hash,
+            request_json,
+            chunk_transform,
+            count,
+        )
+        .await
+        .map(proxy::ensure_chat_inference_id);
+    }
+
+    // For cloud API key requests with streaming, force include_usage AND
+    // continuous_usage_stats so the backend sends running cumulative token
+    // counts on every chunk — not just the final one. This is what makes an
+    // interrupted stream billable (nearai/infra#98): on a client disconnect or
+    // upstream error before [DONE] the last chunk we saw still carries usage, so
+    // `proxy_streaming_request` can report partial usage. include_usage alone only
+    // emits usage in the final chunk, which an interrupted stream never reaches.
+    // (Non-streaming requests also stream internally via proxy_json_request,
+    // which injects stream_options itself, so this only matters for true streaming.)
+    if auth.cloud_api_key.is_some() && is_stream {
+        let stream_opts = request_json
+            .get("stream_options")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut stream_opts = stream_opts;
+        stream_opts.insert("include_usage".into(), true.into());
+        stream_opts.insert("continuous_usage_stats".into(), true.into());
+        request_json["stream_options"] = serde_json::Value::Object(stream_opts);
+    }
+
+    // The first-token deadline is sized by the same estimate, and needs it
+    // only here: on the normal proxy path, for streams, when the feature is
+    // on. The agent loop returned above without paying for it.
+    let estimate = estimate.or_else(|| {
+        (is_stream && state.config.first_token_deadline_ms > 0)
+            .then(|| crate::context_tier::chat_estimate(&request_json))
+    });
+
+    let upstream_data_parallel_rank = state
+        .vllm_dp_affinity
+        .rank_for_chat_request(&request_json, model.id);
+    let modified_body =
+        serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
+
+    // Build encryption transforms if active
+    let (response_transform, chunk_transform) = if let Some(ctx) = enc_ctx {
+        let signing = state.signing.clone();
+        (
+            Some(encryption::make_response_transform(
+                Endpoint::ChatCompletions,
+                ctx.clone(),
+                signing.clone(),
+            )),
+            Some(encryption::make_chunk_transform(
+                Endpoint::ChatCompletions,
+                ctx,
+                signing,
+            )),
+        )
+    } else {
+        (None, None)
+    };
+
+    // Placement hint from cloud-api: honoured under the same trust predicate
+    // as `X-NearAI-Priority` (a caller authenticated with the proxy's own
+    // config token, not an `sk-` API key). An untrusted caller's header is
+    // discarded entirely (treated as absent, no metric), same as priority.
+    let hint = if auth.cloud_api_key.is_none() {
+        parse_replica_hint(&headers)
+    } else {
+        crate::backend_affinity::ReplicaHint::Absent
+    };
+
+    // Lane admission, per-host placement and connection fail-over policy are
+    // shared with text completions. Chat retains its conversation affinity.
+    let placed = place_completion(
+        &state,
+        &model,
+        ROUTE_CHAT_COMPLETIONS,
+        tier,
+        backend_affinity_key,
+        hint,
+    )?;
+    let opts = ProxyOpts {
+        signing: state.signing.clone(),
+        cache: state.cache.clone(),
+        id_prefix: "chatcmpl".to_string(),
+        model_name: model.id.to_string(),
+        model_label: model.label,
+        model_request: *counted_as,
+        usage_reporter: make_usage_reporter_for(&auth, &state, &model),
+        usage_type: UsageType::ChatCompletion,
+        request_hash: Some(request_hash),
+        response_transform,
+        chunk_transform,
+        backend_guard: Some(placed.backend_guard),
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: state.config.sse_keepalive_secs,
+        map_queue_full_to_429: state.config.map_queue_full_to_429,
+        stream_error_peek_ms: state.config.stream_error_peek_ms,
+        stream_commit_ms: state.config.stream_commit_ms,
+        response_shape: ResponseShape::ChatCompletion,
+        tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank,
+        admission: placed.admission,
+        connect_failover: placed.connect_failover,
+        // Gateway mode: refuse instead of committing a 200 the caller is
+        // about to cancel. The clock started when the request arrived, so
+        // authentication and the validation above count against it.
+        first_token_deadline: proxy::first_token_deadline(
+            &state,
+            &model,
+            RequestStart::or_now(request_start),
+            estimate,
+            is_stream,
+        ),
+    };
+
+    if is_stream {
+        proxy::proxy_streaming_request(model.backend_client, &placed.url, modified_body, opts)
+            .await
+            .map(proxy::ensure_chat_inference_id)
+    } else {
+        proxy::proxy_json_request(model.backend_client, &placed.url, modified_body, opts)
+            .await
+            .map(proxy::ensure_chat_inference_id)
+    }
+}
+
+/// Resolve SHA-256 hex digest to use as request_sha256 in signed text.
+///
+/// Default: hash of the wire body. When `allow_x_request_hash_override` is true
+/// (caller authenticated with `config.token`, not `sk-`), if `X-Request-Hash` is
+/// present, decodes to 32 bytes, and differs from the wire body hash, returns the
+/// header value so trusted gateways that re-serialize JSON can bind signatures to
+/// the original client body hash. When false, the header is ignored so end-user
+/// API keys cannot bind signatures to an arbitrary hash.
+pub fn resolve_request_hash_for_signing(
+    headers: &HeaderMap,
+    body_bytes: &[u8],
+    allow_x_request_hash_override: bool,
+) -> String {
+    let body_hash = hex::encode(sha2::Sha256::digest(body_bytes));
+    if !allow_x_request_hash_override {
+        return body_hash;
+    }
+    // HeaderMap::get is case-insensitive; no need to try multiple spellings.
+    if let Some(hv) = headers.get("x-request-hash") {
+        if let Ok(s) = hv.to_str() {
+            let s = s.trim();
+            // hex::decode validates digits and rejects odd length; 32 bytes == SHA-256.
+            if let Ok(bytes) = hex::decode(s) {
+                if bytes.len() == 32 {
+                    let header_hash = hex::encode(&bytes);
+                    if header_hash != body_hash {
+                        return header_hash;
+                    }
+                }
+            }
+        }
+    }
+    body_hash
+}
+
+/// Strip empty tool_calls arrays from messages (vLLM bug workaround).
+fn strip_empty_tool_calls(payload: &mut serde_json::Value) {
+    if let Some(messages) = payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages.iter_mut() {
+            if let Some(obj) = message.as_object_mut() {
+                if let Some(tool_calls) = obj.get("tool_calls") {
+                    if tool_calls.as_array().map(|a| a.is_empty()).unwrap_or(false) {
+                        obj.remove("tool_calls");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read body with size limit.
+pub async fn read_body_with_limit(body: Body, max_size: usize) -> Result<Vec<u8>, AppError> {
+    use http_body_util::BodyExt;
+
+    let mut chunks: Vec<bytes::Bytes> = Vec::new();
+    let mut total_size = 0usize;
+    let mut body = body;
+
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    total_size += data.len();
+                    if total_size > max_size {
+                        return Err(AppError::PayloadTooLarge { max_size });
+                    }
+                    chunks.push(data);
+                }
+            }
+            Some(Err(e)) => {
+                return Err(AppError::Internal(anyhow::anyhow!(
+                    "Error reading body: {e}"
+                )));
+            }
+            None => break,
+        }
+    }
+
+    let mut result = Vec::with_capacity(total_size);
+    for chunk in chunks {
+        result.extend_from_slice(&chunk);
+    }
+    Ok(result)
+}

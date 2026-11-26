@@ -1,0 +1,812 @@
+//! Conversation affinity across independent backends in one `BackendPool`.
+//!
+//! Every backend URL in `VLLM_BACKEND_URLS` is a separate engine with its own
+//! prefix cache. Least-connections selection is free to send consecutive turns
+//! of one chat conversation to different backends, so a long, append-only
+//! conversation (tens or hundreds of thousands of prompt tokens) is re-prefilled
+//! from scratch on every switch. When enabled, the proxy hashes the stable
+//! beginning of a conversation — the same digest `vllm_dp_affinity` uses for
+//! data-parallel ranks — and keeps later turns on the backend that already
+//! holds the prefix in its cache.
+//!
+//! Affinity never overrides health, and it is bounded: if the pinned backend
+//! carries more than `max_imbalance` extra in-flight requests compared to the
+//! least-loaded healthy backend, the turn is rebalanced to the least-loaded
+//! backend and the conversation is re-pinned there.
+
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use moka::sync::Cache;
+use serde_json::Value;
+
+use crate::backend_pool::{BackendGuard, BackendPool, Policy, Selection, SelectionRefusal};
+use crate::model_metrics::{model_counter, model_gauge};
+use crate::vllm_dp_affinity::conversation_key;
+
+const MAX_AFFINITY_ASSIGNMENTS: u64 = 100_000;
+
+/// Header carrying cloud-api's placement hint: a decimal pool index of the
+/// backend it wants this request to land on.
+pub const REPLICA_HINT_HEADER: &str = "x-nearai-replica";
+
+/// Parsed `x-nearai-replica` header value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaHint {
+    /// No header present.
+    Absent,
+    /// Header present but not a plain, in-range, non-negative integer.
+    Invalid,
+    /// Header parsed to this pool index (not yet validated against the pool).
+    Index(usize),
+}
+
+/// Parse the `x-nearai-replica` header: missing → `Absent`; a value that is
+/// not (after trimming) ASCII digits only, is empty, or overflows `usize` →
+/// `Invalid`; otherwise `Index(n)`.
+pub fn parse_replica_hint(headers: &axum::http::HeaderMap) -> ReplicaHint {
+    let Some(value) = headers.get(REPLICA_HINT_HEADER) else {
+        return ReplicaHint::Absent;
+    };
+    let Ok(value) = value.to_str() else {
+        return ReplicaHint::Invalid;
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return ReplicaHint::Invalid;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(index) => ReplicaHint::Index(index),
+        Err(_) => ReplicaHint::Invalid,
+    }
+}
+
+/// Opaque conversation digest used as the affinity key. Contains no prompt
+/// content (salted SHA-256, see `vllm_dp_affinity::conversation_key`).
+pub type ConversationKey = [u8; 32];
+
+/// Where a request was placed: the full URL, the in-flight guard for that
+/// backend, and the backend's index in the pool.
+pub struct Placement {
+    pub url: String,
+    pub guard: BackendGuard,
+    pub index: usize,
+}
+
+impl Placement {
+    fn new(selection: Selection, path: &str) -> Self {
+        Self {
+            url: selection.backend.url(path),
+            index: selection.index,
+            guard: selection.guard,
+        }
+    }
+}
+
+/// Bounded, process-salted, digest-only mapping from a conversation prefix to
+/// a backend index in the pool.
+pub struct BackendConversationAffinity {
+    enabled: bool,
+    max_imbalance: u32,
+    assignments: Cache<ConversationKey, usize>,
+    affinity_salt: [u8; 32],
+}
+
+impl BackendConversationAffinity {
+    /// `enabled` is the operator flag; affinity is only active when the pool
+    /// has more than one backend (a single backend has nothing to pin to).
+    pub fn new(enabled: bool, backend_count: usize, max_imbalance: u32, ttl_secs: u64) -> Self {
+        let assignments = Cache::builder()
+            .max_capacity(MAX_AFFINITY_ASSIGNMENTS)
+            .time_to_idle(Duration::from_secs(ttl_secs.max(1)))
+            .build();
+        Self {
+            enabled: enabled && backend_count > 1,
+            max_imbalance,
+            assignments,
+            affinity_salt: rand::random(),
+        }
+    }
+
+    /// Whether requests can actually be pinned (flag set and ≥2 backends).
+    pub fn is_active(&self) -> bool {
+        self.enabled
+    }
+
+    /// Derive the affinity key for a chat-completions request body, or `None`
+    /// when affinity is inactive or the body is not a chat conversation.
+    pub fn key_for_chat_request(
+        &self,
+        request: &Value,
+        deployed_model_name: &str,
+    ) -> Option<ConversationKey> {
+        if !self.enabled {
+            return None;
+        }
+        conversation_key(request, deployed_model_name, &self.affinity_salt)
+    }
+
+    /// Pick a backend for `key` — plain least-connections without one — and
+    /// return where the request goes. The `policy` bounds lane requests per
+    /// backend (the admission per-host share), marks backends to steer around
+    /// (engine back-pressure, non-empty engine queue) and supplies the engine
+    /// view: a pinned conversation whose backend is at the bound or avoided is
+    /// moved to the least-loaded eligible backend, and `None` means no backend
+    /// has room. With `policy.hold_pin_at_limit` a pin at the bound is not
+    /// moved: the result is `None` and the assignment stays.
+    ///
+    /// `hint` is honoured under the same guard as a pin: the backend must be
+    /// healthy and eligible (tier, admission, not avoided or queueing), and,
+    /// only when there is no engine view, within `max_imbalance` of the
+    /// least-loaded backend.
+    pub fn place(
+        &self,
+        pool: &BackendPool,
+        key: Option<ConversationKey>,
+        hint: ReplicaHint,
+        path: &str,
+        policy: &Policy<'_>,
+    ) -> Option<Placement> {
+        self.try_place(pool, key, hint, path, policy).ok()
+    }
+
+    /// `place` that says why it refused: `PinnedAtLimit` only when the
+    /// conversation's own pin was held (never for a refused replica hint).
+    pub fn try_place(
+        &self,
+        pool: &BackendPool,
+        key: Option<ConversationKey>,
+        hint: ReplicaHint,
+        path: &str,
+        policy: &Policy<'_>,
+    ) -> Result<Placement, SelectionRefusal> {
+        match hint {
+            ReplicaHint::Absent => {}
+            ReplicaHint::Invalid => {
+                model_counter!(pool.model(), "placement_hint_overridden_total", "reason" => "invalid")
+                    .increment(1);
+            }
+            ReplicaHint::Index(i) if i >= pool.len() => {
+                model_counter!(pool.model(), "placement_hint_overridden_total", "reason" => "invalid")
+                    .increment(1);
+            }
+            ReplicaHint::Index(i) => {
+                // A hint is not a pin: it keeps its own guard, hold or not.
+                let hint_policy = Policy {
+                    hold_pin_at_limit: false,
+                    ..*policy
+                };
+                let sel = pool.try_select_with_preference_bounded(
+                    Some(i),
+                    self.max_imbalance,
+                    &hint_policy,
+                );
+                match sel {
+                    Ok(sel) if sel.index == i => {
+                        model_counter!(pool.model(), "placement_hint_honored_total").increment(1);
+                        if let Some(k) = key {
+                            if self.enabled {
+                                self.repin(k, i);
+                            }
+                        }
+                        return Ok(Placement::new(sel, path));
+                    }
+                    Ok(sel) => {
+                        let reason = if !pool.backends()[i].healthy.load(Ordering::Relaxed) {
+                            "unhealthy"
+                        } else {
+                            "imbalance"
+                        };
+                        model_counter!(pool.model(), "placement_hint_overridden_total", "reason" => reason)
+                            .increment(1);
+                        // Drop the probe selection first so its guard releases
+                        // the reservation before the existing path runs.
+                        drop(sel);
+                    }
+                    Err(_) => {
+                        // Nothing is eligible under `policy` (`pick`'s scan ignores
+                        // `preferred`), and the probe already recorded that refusal;
+                        // the fallback would only refuse and count it again.
+                        let reason = if !pool.backends()[i].healthy.load(Ordering::Relaxed) {
+                            "unhealthy"
+                        } else {
+                            "imbalance"
+                        };
+                        model_counter!(pool.model(), "placement_hint_overridden_total", "reason" => reason)
+                            .increment(1);
+                        // The probe never holds a pin, so this is never
+                        // `PinnedAtLimit` even when the pin is also full.
+                        return Err(SelectionRefusal::Other);
+                    }
+                }
+            }
+        }
+
+        let Some(key) = key else {
+            let selection = pool.try_select_with_preference_bounded(None, 0, policy)?;
+            return Ok(Placement::new(selection, path));
+        };
+
+        let existing = self.assignments.get(&key);
+        let selection =
+            pool.try_select_with_preference_bounded(existing, self.max_imbalance, policy)?;
+        if existing != Some(selection.index) {
+            // New conversation, or the pinned backend was unhealthy/overloaded:
+            // remember where this turn actually went so the next turn follows
+            // the prefix cache that is being built there.
+            self.assignments.insert(key, selection.index);
+        }
+
+        model_counter!(
+            pool.model(),
+            "backend_affinity_lookups_total",
+            "outcome" => if existing.is_some() { "hit" } else { "miss" }
+        )
+        .increment(1);
+        model_counter!(
+            pool.model(),
+            "backend_affinity_selections_total",
+            "outcome" => selection.outcome.as_str(),
+            "backend" => selection.index.to_string()
+        )
+        .increment(1);
+        model_gauge!(pool.model(), "backend_affinity_assignments")
+            .set(self.assignments.entry_count() as f64);
+
+        Ok(Placement::new(selection, path))
+    }
+
+    /// Move a conversation to `index` (connection fail-over placed it there).
+    pub fn repin(&self, key: ConversationKey, index: usize) {
+        if self.enabled {
+            self.assignments.insert(key, index);
+        }
+    }
+
+    /// Current pinned backend index for a key (tests and diagnostics).
+    #[cfg(test)]
+    fn assignment(&self, key: &ConversationKey) -> Option<usize> {
+        self.assignments.get(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn share2() -> Policy<'static> {
+        Policy {
+            max_conns: Some(2),
+            ..Policy::NONE
+        }
+    }
+
+    fn avoid_b1() -> Policy<'static> {
+        fn first(index: usize) -> bool {
+            index == 0
+        }
+        Policy {
+            avoid: &first,
+            ..Policy::NONE
+        }
+    }
+
+    fn two_backend_pool() -> BackendPool {
+        BackendPool::new(vec![
+            "http://b1:8000".to_string(),
+            "http://b2:8000".to_string(),
+        ])
+    }
+
+    fn turn(n: usize) -> Value {
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "Be concise"}),
+            serde_json::json!({"role": "user", "content": "Find the weather"}),
+        ];
+        for i in 0..n {
+            messages
+                .push(serde_json::json!({"role": "assistant", "content": format!("Sunny {i}")}));
+            messages.push(serde_json::json!({"role": "user", "content": format!("And day {i}?")}));
+        }
+        serde_json::json!({"model": "client-alias", "messages": messages})
+    }
+
+    #[test]
+    fn disabled_or_single_backend_yields_no_key() {
+        let chat = turn(0);
+        assert!(BackendConversationAffinity::new(false, 2, 8, 1_200)
+            .key_for_chat_request(&chat, "model")
+            .is_none());
+        assert!(BackendConversationAffinity::new(true, 1, 8, 1_200)
+            .key_for_chat_request(&chat, "model")
+            .is_none());
+        assert!(!BackendConversationAffinity::new(true, 1, 8, 1_200).is_active());
+        assert!(BackendConversationAffinity::new(true, 2, 8, 1_200).is_active());
+    }
+
+    #[test]
+    fn later_turns_stay_on_the_first_turn_backend() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+
+        // Turn 1: both idle → least-connections picks b1.
+        let key = affinity.key_for_chat_request(&turn(0), "model");
+        let Placement { url, guard, .. } = affinity
+            .place(
+                &pool,
+                key,
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(url, "http://b1:8000/v1/chat/completions");
+        drop(guard);
+
+        // b1 is now busier than b2 but within the imbalance bound: turn 2 must
+        // still follow the prefix cache on b1 (least-connections alone would
+        // have moved it to b2).
+        pool.backends()[0].active_conns.store(5, Ordering::Relaxed);
+        let key = affinity.key_for_chat_request(&turn(1), "model");
+        let Placement {
+            url, guard: _guard, ..
+        } = affinity
+            .place(
+                &pool,
+                key,
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(url, "http://b1:8000/v1/chat/completions");
+        assert_eq!(affinity.assignment(&key.unwrap()), Some(0));
+    }
+
+    #[test]
+    fn new_conversations_balance_by_least_connections() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+        pool.backends()[0].active_conns.store(3, Ordering::Relaxed);
+
+        let other = serde_json::json!({
+            "messages": [{"role": "user", "content": "a different conversation"}]
+        });
+        let key = affinity.key_for_chat_request(&other, "model");
+        let Placement {
+            url, guard: _guard, ..
+        } = affinity
+            .place(
+                &pool,
+                key,
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(url, "http://b2:8000/v1/chat/completions");
+        assert_eq!(affinity.assignment(&key.unwrap()), Some(1));
+    }
+
+    #[test]
+    fn overloaded_pin_is_rebalanced_and_repinned() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 4, 1_200);
+
+        let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
+        let Placement { url, guard, .. } = affinity
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(url, "http://b1:8000/v1/chat/completions");
+        drop(guard);
+
+        // b1 has 5 more in-flight requests than b2 (> max_imbalance 4).
+        pool.backends()[0].active_conns.store(5, Ordering::Relaxed);
+        let Placement { url, guard, .. } = affinity
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(url, "http://b2:8000/v1/chat/completions");
+        assert_eq!(affinity.assignment(&key), Some(1));
+        drop(guard);
+
+        // Once re-pinned, the conversation follows its new home even after b1
+        // becomes idle again.
+        pool.backends()[0].active_conns.store(0, Ordering::Relaxed);
+        pool.backends()[1].active_conns.store(2, Ordering::Relaxed);
+        let Placement {
+            url, guard: _guard, ..
+        } = affinity
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(url, "http://b2:8000/v1/chat/completions");
+    }
+
+    #[test]
+    fn unhealthy_pin_falls_back_to_a_healthy_backend() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+
+        let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
+        let Placement { url, guard, .. } = affinity
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(url, "http://b1:8000/v1/chat/completions");
+        drop(guard);
+
+        pool.backends()[0].healthy.store(false, Ordering::Relaxed);
+        let Placement {
+            url, guard: _guard, ..
+        } = affinity
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(url, "http://b2:8000/v1/chat/completions");
+        assert_eq!(affinity.assignment(&key), Some(1));
+    }
+
+    /// Simulate `n` lane requests on backend `index`.
+    fn set_lane_conns(pool: &BackendPool, index: usize, n: u32) {
+        pool.backends()[index]
+            .active_conns
+            .store(n, Ordering::Relaxed);
+        pool.backends()[index]
+            .lane_conns
+            .store(n, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn pinned_conversation_moves_when_its_host_is_at_the_share() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+
+        let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
+        let Placement { url, guard, .. } = affinity
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &share2(),
+            )
+            .unwrap();
+        assert_eq!(url, "http://b1:8000/v1/chat/completions");
+        drop(guard);
+
+        // b1 holds its whole share (2 lane requests in flight): the next turn
+        // moves to b2 even though the imbalance (2) is within the bound (8).
+        set_lane_conns(&pool, 0, 2);
+        let placement = affinity
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &share2(),
+            )
+            .unwrap();
+        assert_eq!(placement.index, 1);
+        assert_eq!(affinity.assignment(&key), Some(1));
+        drop(placement);
+
+        // Both at the share: nothing to place, with or without a key.
+        set_lane_conns(&pool, 1, 2);
+        assert!(affinity
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &share2()
+            )
+            .is_none());
+        assert!(affinity
+            .place(
+                &pool,
+                None,
+                ReplicaHint::Absent,
+                "/v1/completions",
+                &share2()
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn pinned_conversation_moves_off_an_avoided_host_and_repins() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+        let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
+        let placement = affinity
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(placement.index, 0);
+        drop(placement);
+
+        // b1 just rejected at engine admission: steer the next turn to b2.
+        let placement = affinity
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &avoid_b1(),
+            )
+            .unwrap();
+        assert_eq!(placement.index, 1);
+        assert_eq!(affinity.assignment(&key), Some(1));
+        drop(placement);
+
+        // Fail-over re-pins explicitly.
+        affinity.repin(key, 0);
+        assert_eq!(affinity.assignment(&key), Some(0));
+    }
+
+    #[test]
+    fn without_a_key_selection_is_plain_least_connections() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+        pool.backends()[0].active_conns.store(1, Ordering::Relaxed);
+        let Placement {
+            url, guard: _guard, ..
+        } = affinity
+            .place(
+                &pool,
+                None,
+                ReplicaHint::Absent,
+                "/v1/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(url, "http://b2:8000/v1/completions");
+    }
+
+    fn hdr(v: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(REPLICA_HINT_HEADER, v.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn parse_hint_values() {
+        assert_eq!(
+            parse_replica_hint(&axum::http::HeaderMap::new()),
+            ReplicaHint::Absent
+        );
+        assert_eq!(parse_replica_hint(&hdr("2")), ReplicaHint::Index(2));
+        assert_eq!(parse_replica_hint(&hdr(" 2 ")), ReplicaHint::Index(2));
+        for bad in ["", "-1", "x", "1.0", "99999999999999999999999"] {
+            assert_eq!(parse_replica_hint(&hdr(bad)), ReplicaHint::Invalid, "{bad}");
+        }
+    }
+
+    #[test]
+    fn healthy_balanced_hint_is_honoured() {
+        let pool = BackendPool::new(vec![
+            "http://a".into(),
+            "http://b".into(),
+            "http://c".into(),
+        ]);
+        let aff = BackendConversationAffinity::new(false, 3, 8, 60);
+        let p = aff
+            .place(
+                &pool,
+                None,
+                ReplicaHint::Index(2),
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(p.index, 2);
+    }
+
+    #[test]
+    fn unhealthy_hint_falls_back() {
+        let pool = BackendPool::new(vec!["http://a".into(), "http://b".into()]);
+        pool.backends()[1].healthy.store(false, Ordering::Relaxed);
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let p = aff
+            .place(&pool, None, ReplicaHint::Index(1), "/x", &Policy::NONE)
+            .unwrap();
+        assert_eq!(p.index, 0);
+    }
+
+    #[test]
+    fn overloaded_hint_falls_back_to_least_loaded() {
+        let pool = BackendPool::new(vec!["http://a".into(), "http://b".into()]);
+        pool.backends()[1].active_conns.store(20, Ordering::Relaxed);
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let p = aff
+            .place(&pool, None, ReplicaHint::Index(1), "/x", &Policy::NONE)
+            .unwrap();
+        assert_eq!(p.index, 0);
+    }
+
+    #[test]
+    fn out_of_range_and_invalid_hints_fall_back() {
+        let pool = BackendPool::new(vec!["http://a".into()]);
+        let aff = BackendConversationAffinity::new(false, 1, 8, 60);
+        for h in [ReplicaHint::Index(5), ReplicaHint::Invalid] {
+            assert_eq!(
+                aff.place(&pool, None, h, "/x", &Policy::NONE)
+                    .unwrap()
+                    .index,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn hint_outside_requested_tier_is_not_honoured() {
+        let pool = BackendPool::with_long_context(vec!["http://b".into()], vec!["http://l".into()]);
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let policy = Policy {
+            tier: Some(crate::context_tier::ContextTier::Base),
+            ..Policy::NONE
+        };
+        let p = aff
+            .place(&pool, None, ReplicaHint::Index(1), "/x", &policy)
+            .unwrap();
+        assert_eq!(p.index, 0);
+    }
+
+    #[test]
+    fn honoured_hint_repins_conversation() {
+        let pool = BackendPool::new(vec!["http://a".into(), "http://b".into()]);
+        let aff = BackendConversationAffinity::new(true, 2, 8, 60);
+        let key = [9u8; 32];
+        let first = aff
+            .place(&pool, Some(key), ReplicaHint::Index(1), "/x", &Policy::NONE)
+            .unwrap();
+        assert_eq!(first.index, 1);
+        drop(first);
+        let next = aff
+            .place(&pool, Some(key), ReplicaHint::Absent, "/x", &Policy::NONE)
+            .unwrap();
+        assert_eq!(next.index, 1);
+    }
+
+    #[test]
+    fn hint_with_engine_view_holds_on_busy_but_not_queueing_backend() {
+        let pool = two_backend_pool();
+        set_lane_conns(&pool, 1, 20);
+        let engine = |_: usize| Some((5, 0));
+        fn not_avoided(_: usize) -> bool {
+            false
+        }
+        let policy = Policy {
+            avoid: &not_avoided,
+            engine: &engine,
+            ..Policy::NONE
+        };
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let p = aff
+            .place(&pool, None, ReplicaHint::Index(1), "/x", &policy)
+            .unwrap();
+        assert_eq!(p.index, 1);
+    }
+
+    #[test]
+    fn hint_to_queueing_backend_is_overridden() {
+        let pool = two_backend_pool();
+        set_lane_conns(&pool, 1, 20);
+        let engine = |_: usize| Some((5, 0));
+        fn avoided(index: usize) -> bool {
+            index == 1
+        }
+        let policy = Policy {
+            avoid: &avoided,
+            engine: &engine,
+            ..Policy::NONE
+        };
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let p = aff
+            .place(&pool, None, ReplicaHint::Index(1), "/x", &policy)
+            .unwrap();
+        assert_eq!(p.index, 0);
+    }
+
+    /// A hint on a saturated pool refuses once, without running the fallback.
+    #[test]
+    fn saturated_pool_with_hint_still_refuses_cleanly() {
+        let pool = two_backend_pool();
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let policy = Policy {
+            max_conns: Some(0),
+            ..Policy::NONE
+        };
+        assert!(aff
+            .place(&pool, None, ReplicaHint::Index(0), "/x", &policy)
+            .is_none());
+    }
+
+    #[test]
+    fn hold_keeps_the_pin_at_the_limit_and_default_moves_it() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+        let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
+        let first = affinity
+            .place(&pool, Some(key), ReplicaHint::Absent, "/x", &share2())
+            .unwrap();
+        let pinned = first.index;
+        drop(first);
+        set_lane_conns(&pool, pinned, 2);
+        let hold = Policy {
+            hold_pin_at_limit: true,
+            ..share2()
+        };
+
+        assert_eq!(
+            affinity
+                .try_place(&pool, Some(key), ReplicaHint::Absent, "/x", &hold)
+                .err(),
+            Some(SelectionRefusal::PinnedAtLimit)
+        );
+        // A refused hint probe is not the pin's refusal, even with the pin full.
+        set_lane_conns(&pool, 1 - pinned, 2);
+        assert_eq!(
+            affinity
+                .try_place(
+                    &pool,
+                    Some(key),
+                    ReplicaHint::Index(1 - pinned),
+                    "/x",
+                    &hold
+                )
+                .err(),
+            Some(SelectionRefusal::Other)
+        );
+        set_lane_conns(&pool, 1 - pinned, 0);
+        assert_eq!(affinity.assignment(&key), Some(pinned), "no re-pin");
+
+        // A replica hint keeps its own rules: it is not a pin.
+        let other = 1 - pinned;
+        let hinted = affinity
+            .place(&pool, Some(key), ReplicaHint::Index(other), "/x", &hold)
+            .unwrap();
+        assert_eq!(hinted.index, other);
+        drop(hinted);
+        affinity.repin(key, pinned);
+
+        // Without the hold the same state moves the conversation.
+        let moved = affinity
+            .place(&pool, Some(key), ReplicaHint::Absent, "/x", &share2())
+            .unwrap();
+        assert_eq!(moved.index, other);
+        assert_eq!(affinity.assignment(&key), Some(other));
+    }
+}
