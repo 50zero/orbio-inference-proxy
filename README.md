@@ -1,1 +1,470 @@
-# orbio-inference-proxy
+# vllm-proxy-rs
+
+Rust proxy for vLLM/sglang inference engines running in GPU TEE environments. Adds Intel TDX + NVIDIA GPU attestation and cryptographic signing (ECDSA secp256k1 + Ed25519) to standard OpenAI-compatible API endpoints.
+
+Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
+
+## Features
+
+- **Dual signing** — every response is signed with both ECDSA (EIP-191, secp256k1) and Ed25519. Signatures are cached and retrievable per chat ID.
+- **TEE attestation** — generates Intel TDX quotes via [dstack-sdk](https://github.com/Dstack-TEE/dstack) and NVIDIA GPU evidence via Python subprocess.
+- **Backend-agnostic** — works with any OpenAI-compatible backend (vLLM, sglang, etc.).
+- **Streaming support** — SSE streams are hashed incrementally and signed on completion.
+- **In-memory cache** — moka-based TTL cache for signatures (no Redis dependency).
+
+## Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/` | No | Health check |
+| GET | `/version` | No | Proxy version |
+| GET | `/v1/metrics` | No | Backend metrics passthrough |
+| GET | `/v1/models` | No | Backend models passthrough |
+| POST | `/v1/chat/completions` | Yes | Chat completions (streaming + non-streaming) |
+| POST | `/v1/completions` | Yes | Text completions |
+| POST | `/v1/embeddings` | Yes | Embeddings |
+| POST | `/v1/tokenize` | Yes | Tokenization (no signing) |
+| POST | `/v1/rerank` | Yes | Reranking (at most 4,096 `documents`; more is a `400` before dispatch). Concurrent requests are limited: by default 2 per Cloud API organization + workspace, 16 for all Cloud API keys, 16 shared by the config tokens (`VLLM_PROXY_RERANK_MAX_INFLIGHT_*`); over the limit is a `429` with `Retry-After` before dispatch (counted in `inference_proxy_rerank_refused_total{limit}`) |
+| POST | `/v1/score` | Yes | Scoring |
+| POST | `/v1/privacy/classify` | Yes | Privacy classification |
+| POST | `/v1/images/generations` | Yes | Image generation. A top-level key outside the supported list (`IMAGE_GENERATION_FIELDS`) is a 400 |
+| POST | `/v1/images/edits` | Yes | Image editing (multipart). A form field outside the supported list (`IMAGE_EDIT_FORM_FIELDS`) is a 400 |
+| POST | `/v1/audio/transcriptions` | Yes | Audio transcription (multipart). A form field outside the supported list (`AUDIO_TRANSCRIPTION_FORM_FIELDS`) is a 400 |
+| GET | `/v1/signature/{chat_id}` | Yes | Retrieve cached signature |
+| GET | `/v1/attestation/report` | No | TEE attestation report. Cached reports remain available when fresh requests are at capacity. |
+| POST | `/internal/gpu_evidence` | Trusted token | Sibling-proxy GPU evidence |
+
+All other paths return `404` locally. They are never forwarded to the backend
+inference engine.
+
+## Error Handling
+
+All error responses use the OpenAI-compatible JSON format:
+
+```json
+{"error": {"message": "...", "type": "...", "param": null, "code": null}}
+```
+
+### Proxy-generated errors
+
+| Status | Type | When |
+|--------|------|------|
+| 400 | `bad_request` | Invalid JSON, bad parameters |
+| 401 | `unauthorized` | Invalid or missing Bearer token |
+| 404 | `not_found` | Signature chat ID not found |
+| 413 | `payload_too_large` | Request body exceeds size limit |
+| 429 | `rate_limited` | Per-IP rate limit exceeded |
+| 500 | `server_error` | Internal proxy error (details hidden from client) |
+
+### Upstream errors (vLLM/sglang)
+
+Named routes (`/v1/chat/completions`, `/v1/completions`, etc.) pass through the backend error body verbatim, preserving the original status code.
+
+Common upstream errors:
+
+| Status | Type | Example message |
+|--------|------|-----------------|
+| 400 | `BadRequestError` | `"This model's maximum context length is 2048 tokens. However, you requested 4374 tokens"` |
+| 400 | `BadRequestError` | `"temperature must be non-negative, got -0.5"` |
+| 400 | `BadRequestError` | `"Stream options can only be defined when 'stream=True'"` |
+| 400 | `BadRequestError` | `"please provide at least one prompt"` |
+| 400 | `BadRequestError` | `"auto tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set"` |
+| 404 | `Not Found` | `"The model 'gpt-5' does not exist"` |
+| 422 | `Bad Request` | Pydantic validation details (field type mismatches) |
+| 500 | `InternalServerError` | `"Internal server error"` (GPU OOM, engine crash) |
+| 501 | `NotImplementedError` | `"Tool usage is only supported for Chat Completions API"` |
+
+### Logging and privacy
+
+All upstream errors are logged with structured fields for diagnostics:
+
+```
+WARN request{request_id=abc-123 method=POST path=/v1/chat/completions}:
+  Backend returned non-success status
+  upstream_status=400 upstream_url=http://vllm:8000/v1/chat/completions
+  error_message="This model's maximum context length is 2048 tokens..."
+  error_type=BadRequestError
+```
+
+**What is logged**: HTTP status codes, backend URLs, error messages (token counts, parameter names), error types, request IDs.
+
+**One line per request.** A successful inference request logs `request completed` (ids, tokens, duration, `auth_path`, `tenant_context`, `caller`). Any other request on an inference, signature, attestation, OHTTP or internal route logs exactly one of:
+
+- `request finished`: the response was sent and no `request completed` line was written (an error status, or a route without a completion line). Fields: `status`, `duration_ms`, `request_bytes` (from `Content-Length`), `outcome` (`complete`, or `body_error` when the body failed while sent), the route pattern, the method and the identity below. Signature and attestation lookups log it only for an error status.
+- `request cancelled`: the client went away before the response (`phase="before_response"`) or while its body was being sent (`phase="during_response"`), with `elapsed_ms` and the identity below.
+
+Both lines carry `org_id`, `workspace_id`, `auth_path`, `ingress_route`, `tenant_context` and `caller` once auth has passed, and nothing taken from the request's content, headers, query string or raw path. The `request` span gets the bounded labels only (`auth_path`, `tenant_context`, `caller`), so other lines do not gain tenant ids. When the backend was sent a request id other than `request_id` (the Cloud API key path, which a gateway serves), the completion, finish, cancel and `Backend returned non-success status` lines also carry it as `upstream_request_id`: a server-generated UUID that the backend logs as its own `request_id`, so the two join even when the request failed. Health, metrics, version, model-list and OHTTP key routes, and unmatched paths, log neither line. `active_connections` counts a request until its response body is sent or dropped.
+
+**Missing tenant.** A request authenticated with a config token on a customer route (chat, completions, embeddings, rerank, score, tokenize, privacy classification, images, audio) that sends no `X-Org-Id` is counted in `inference_proxy_requests_without_tenant_total{route, ingress_route, caller}` and is never refused. A WARN `Trusted request on a customer route has no org id` is written at most once a minute per route and caller, with `suppressed` = how many it stands for. Callers labeled `probe` (or `probe-…`, `probe_…`, see `TOKEN_LABELS`) are not counted.
+
+**What is never logged**: Request bodies, response bodies, prompt content, user messages, completion text.
+
+## Configuration
+
+All configuration is via environment variables:
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `MODEL_NAME` | Yes | — | Model name for cache key namespacing |
+| `TOKEN` | Yes | — | Bearer token for API authentication |
+| `TOKEN_LABELS` | No | unset | Comma-separated caller label for each `TOKEN` entry, in the same order (e.g. `cloud-api,gateway,probe`). The matched token's label is the request's `caller` on the completion line and on the `inference_proxy_completed_requests_total`, `inference_proxy_input_tokens*` and `inference_proxy_request_duration_seconds` series. Unset: every token is `unlabeled`. A label is 1-32 lowercase letters, digits, `-` or `_`, never a token; the count must match `TOKEN` or startup fails. `api_key` (Cloud API key requests), `unknown` and `unlabeled` are reserved |
+| `VLLM_BASE_URL` | No | `http://localhost:8000` | Backend base URL |
+| `VLLM_DATA_PARALLEL_SIZE` | No | unset | Number of independent vLLM DP engines in one backend. When set, assigns new chat conversations round-robin and keeps append-only turns on the same rank via `X-data-parallel-rank`, improving local prefix-cache reuse without trusting a client-supplied rank. Requires exactly one backend URL. |
+| `VLLM_BACKEND_CONVERSATION_AFFINITY` | No | `false` | With several `VLLM_BACKEND_URLS`, keep append-only chat conversations on the backend that served their first turn (same salted conversation digest as the DP affinity above) so multi-turn prompts reuse that engine's prefix cache instead of being re-prefilled after every least-connections switch. New conversations still go to the least-loaded healthy backend; an unhealthy pinned backend is skipped. Applies to the exact and alias `/v1/chat/completions` routes; other routes keep least-connections. Mutually exclusive with `VLLM_DATA_PARALLEL_SIZE`. |
+| `VLLM_BACKEND_AFFINITY_MAX_IMBALANCE` | No | `8` | Load-balance guard for the affinity above: when the pinned backend has more than this many extra in-flight requests over the least-loaded healthy backend, the turn goes to the least-loaded backend and the conversation is re-pinned there. It also bounds a trusted `x-nearai-replica` hint (see below) when there is no engine view. |
+| `DEV` | No | `false` | Dev mode (random signing keys instead of KMS) |
+| `GPU_NO_HW_MODE` | No | `false` | Use canned GPU evidence |
+| `CHAT_CACHE_EXPIRATION` | No | `1200` | Signature cache TTL in seconds |
+| `VLLM_PROXY_MAX_REQUEST_SIZE` | No | `10485760` | Max JSON request body (bytes) |
+| `VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE` | No | `52428800` | Max image request body (bytes) |
+| `VLLM_PROXY_MAX_AUDIO_REQUEST_SIZE` | No | `104857600` | Max audio request body (bytes) |
+| `OHTTP_BUFFER_BUDGET_BYTES` | No | `268435456` | Shared payload bytes for OHTTP requests and buffered standard responses. Capacity exhaustion returns 429. Allow additional memory for decoding and encryption. |
+| `OHTTP_MAX_RESPONSE_BYTES` | No | `33554432` | Maximum inner response body for standard OHTTP. Larger responses require chunked OHTTP. |
+| `VLLM_PROXY_IMAGE_VALIDATION_DISABLED` | No | `false` | Disable pre-dispatch image URL/data validation |
+| `VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS` | No | `5` | Per-fetch timeout and semaphore acquire deadline for validation |
+| `VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES` | No | `8192` | Max fetched/decode-head bytes used for image sniffing |
+| `VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY` | No | `8` | Global concurrent outbound image-validation fetches |
+| `VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS` | No | `false` | Permit private/loopback image hosts for trusted deployments/tests |
+| `VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS` | No | empty; Gemma-4 defaults to `prod-files-secure.s3.us-west-2.amazonaws.com` | Exact remote `image_url` host allowlist enforced before fetch and on every redirect hop. When unset, falls back to `VLLM_ALLOWED_MEDIA_DOMAINS`; set explicitly to an empty string to disable the proxy-side domain restriction |
+| `VLLM_ALLOWED_MEDIA_DOMAINS` | No | empty | vLLM-compatible media-domain allowlist used by the proxy only when `VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS` is unset |
+| `VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB` | No | `false` (`1` forces strict mode) | Gemma-4 defaults to rejecting observed one-channel PNG/JPEG crash inputs; set `1` to reject broader non-RGB PNG/JPEG classes |
+| `VLLM_PROXY_MAX_KEEPALIVE` | No | `100` | Connection pool max idle per host |
+| `VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS` | No | `0` (disabled) | Maximum idle time between upstream SSE chunks after the first client-visible generation-progress event. It does not cap queueing, prefill, or a metadata-only assistant-role event (vLLM may emit that before hidden reasoning). When enabled, internally reassembled JSON fails with 504; native streams terminate with a body error. EOF without `[DONE]` is also treated as incomplete |
+| `LISTEN_PORT` | No | `8000` | Server listen port |
+| `LISTEN_ADDR` | No | `0.0.0.0` | Interface to bind |
+| `VLLM_BACKEND_TOKEN` | No | unset | Bearer attached to backend requests only (gateway mode: the backends are CVM inference-proxies and accept it as a trusted config token). Never sent to cloud-api |
+| `VLLM_BACKEND_PRIORITY` | No | unset | Gateway mode: engine priority for this proxy's traffic, sent as `X-NearAI-Priority` on every backend request (e.g. `-1` for the OpenRouter lane). The CVM proxy honors the header only from callers using its `TOKEN`; it sets `priority` on every chat/completions body itself (header value or 0), discarding client values |
+| `VLLM_BACKEND_HEALTH_PATH` | No | `/health` | Path probed by the pool health checker and `/healthz` |
+| `ATTESTATION_MAX_INFLIGHT` | No | `5` | Maximum fresh public attestation requests per process, including requests waiting for GPU collection. At capacity the endpoint returns 429 with `Retry-After: 2`. Must be positive. |
+| `NON_TEE_DEPLOYMENT` | No | `false` | This proxy runs outside a TEE: `/healthz` skips the dstack probe, the attestation cache refresh is not started, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` return 404 |
+| `VLLM_PROXY_PRIORITY_LOWER_FIRST` | No | `false` | The engine runs the lowest `priority` first (vLLM `--scheduling-policy priority`): the proxy writes the negated value, so `X-NearAI-Priority` keeps one meaning (higher = more important; the OpenRouter lane's `-1` and reseller orgs' `-2` run after cloud-api's 0) on SGLang and vLLM. Leave off for SGLang |
+| `VLLM_PROXY_PRIORITY_SIZE_TIERS` | No | unset (off) | CVM proxy only: size bonus on the engine `priority`, `MAX_TOKENS:BONUS,...,*:BONUS` (e.g. `16000:10,65536:5,*:0`; estimated prompt tokens, ascending, inclusive; bonus 0-99; last entry `*`; malformed = startup error). Engine value = caller class × 100 + bonus, then `VLLM_PROXY_PRIORITY_LOWER_FIRST` negation, so short prompts run first within a class and never outrank a higher class. Set it only on proxies whose engine runs priority scheduling (SGLang `--enable-priority-scheduling`; vLLM `--scheduling-policy priority`); see docs/gateway-mode.md §Priority for the preemption-threshold interaction |
+| `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | No | `false` | Rewrite the engine's admission rejection (503: SGLang "The request queue is full." / "aborted by a higher priority request"; vLLM `--max-num-queued-reqs` / `--max-num-queued-tokens` "The engine is currently busy…" / "…prefill token backlog limit") to 429 with `Retry-After: 2` and type `overloaded`. Off in CVMs: cloud-api's peer fallback keys on the 503 |
+| `VLLM_PROXY_STREAM_ERROR_PEEK_MS` | No | `0` (off) | Streaming: wait up to this long for the first upstream SSE chunk before committing a 200; an admission-time `data: {"error":…}` first event becomes a real error status instead of a 200 that fails mid-stream |
+| `VLLM_PROXY_STREAM_COMMIT_MS` | No | `0` (off) | Streaming: commit `200 text/event-stream` after this long even when the upstream has not answered, so keep-alives can start during a long prefill. Past the window an upstream failure arrives as a terminal SSE `error` event, not a status — set it above the slowest error the deployment produces |
+| `VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS` | No | `0` (off) | Gateway mode: refuse a streaming request with `429` + `Retry-After` when the upstream has not produced its first SSE event this long after the request arrived (authentication included), instead of committing a 200 an aggregator is about to cancel and book as our timeout. Such a request waits for that event regardless of `VLLM_PROXY_STREAM_ERROR_PEEK_MS`, since an engine may send its `200` before generating anything. Such a request is not committed early — `VLLM_PROXY_STREAM_COMMIT_MS` does not apply to it — and on a refusal the upstream request is dropped and its admission slot released (counted in `first_token_deadline_refusals_total`) |
+| `VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS` | No | `0` | Added to that deadline per 1,000 estimated prompt tokens (the long-context tier's estimate, computed even when that tier is off), because the caller's own deadline grows with the prompt too. Requires the base deadline |
+| `VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS` | No | `0` (no cap) | Requests whose computed deadline is above this get none, and keep the commit window and keep-alives. Requires the base deadline, and must be at least as large |
+| `VLLM_PROXY_ALLOWED_ORG_IDS` | No | empty | Organizations whose cloud-api keys may use this deployment (comma-separated ids from `/v1/check_api_key`); other valid keys get 403 (counted in `cloud_api_org_allowlist_rejections_total`). Empty = everyone. Config-token callers are not gated |
+| `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | No | empty | Chat content part `type`s refused with 400 before dispatch, e.g. `video_url,input_audio,file` |
+| `VLLM_PROXY_MODEL_LIST_FILE` | No | unset | Gateway mode: path of a JSON file listing several models for this one process to serve, each with its own backends (optionally a per-host in-flight ceiling, `backend_max_inflight`), admission budget, tier, discount and backend token (named by environment variable, never in the file). Chat/completions then select the model by the body's `model` (exact match, otherwise 404 `model_not_found`). Replaces `MODEL_NAME` and the backend URL lists, which must be unset; the other per-model variables become defaults for the list's entries. Requires `NON_TEE_DEPLOYMENT=1` and `VLLM_PROXY_MODELS_DOCUMENT_URL`. Unset = one model from the environment. See [docs/gateway-mode.md](docs/gateway-mode.md#several-models-in-one-gateway) |
+| `VLLM_PROXY_MODELS_DOCUMENT_URL` | No | empty | Gateway mode: serve `GET /v1/models` from this URL (cloud-api's `/v1/models`: pricing, modalities, `is_ready`, `openrouter.slug`) reduced to `MODEL_NAME` and completed with `capacity`; when the source cannot be read the engine's own list is passed through (counted in `models_document_source_failures_total`). A URL under `{CLOUD_API_URL}/v1/internal/` (cloud-api's internal catalog, which also carries the models cloud-api does not list publicly) is read with `CLOUD_API_USAGE_TOKEN`, which is then required; any other URL is read without credentials |
+| `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | No | `0` (not declared) | Requests per minute declared in the models document's `capacity`; the concurrency entry is `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` |
+| `VLLM_PROXY_DISCOUNT_TO_USER` | No | empty (list price) | Gateway mode: the lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off; empty or `0` = none; an invalid value fails startup). Requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. Published as `discount_to_user` on the models document entry (and on every entry of the engine list served while that source is unreadable) and sent as `discount_to_user` on every usage report, so the advertised and the billed price come from one setting |
+| `VLLM_PROXY_STRICT_REQUEST_MODEL` | No | off | Single-model mode: a body `model` must be `MODEL_NAME` byte for byte (404 `model_not_found` otherwise, 400 for a non-string; a missing `model` is still served), on chat, completions, the JSON routes and the `model` field of the multipart routes. Off, the process serves its one model whatever the body says. List mode always matches exactly |
+| `VLLM_PROXY_BACKEND_LORA` | No | unset | Single-model mode, SGLang with `--enable-lora`: the adapter that `MODEL_NAME` stands for, set as `lora_path` on the chat, completions and embeddings bodies forwarded to the engine. Requires `VLLM_PROXY_STRICT_REQUEST_MODEL=1` (startup fails otherwise). Independent of both, a request carrying `lora_path`, `lora_id` or `lora_name` (a form field on the multipart routes) is always a 400 |
+| `VLLM_PROXY_REQUEST_GUARD` | No | on | Request field guard (`src/request_guard.rs`) on every route that forwards a JSON body (chat, completions, tokenize, embeddings, rerank, score, privacy classify, images/generations; `src/forward_body.rs`) and on the fields of the multipart routes (images/edits, audio/transcriptions): out-of-bounds fields are a 400 `invalid_request_error` with `param` set, engine-internal fields are stripped, and `/v1/images/generations` forwards only `IMAGE_GENERATION_FIELDS`. Chat, completions and tokenize get the sampling rules too. `0` turns all of it off (the multipart form-field lists are separate and stay on); for each limit below, `0` turns that rule off. Each POST route declares in `routes::POST_ROUTES` whether its body takes this step |
+| `VLLM_PROXY_MAX_TOP_LOGPROBS` | No | `20` | Max `top_logprobs`, and `logprobs` when it is a number |
+| `VLLM_PROXY_MAX_N` | No | `8` | Max `n` (chat, completions) |
+| `VLLM_PROXY_MAX_LOGIT_BIAS_ENTRIES` / `VLLM_PROXY_MAX_LOGIT_BIAS_VALUE` | No | `300` / `100` | Max `logit_bias` entries and `\|value\|`; keys must be token ids, values finite |
+| `VLLM_PROXY_MAX_STOP_SEQUENCES` / `VLLM_PROXY_MAX_STOP_SEQUENCE_CHARS` | No | `16` / `1024` | Max `stop` entries and characters per entry |
+| `VLLM_PROXY_MAX_STOP_TOKEN_IDS` | No | `64` | Max `stop_token_ids` entries; each must be a non-negative token id |
+| `VLLM_PROXY_VOCAB_SIZE` | No | unset | Token ids in `logit_bias`, `stop_token_ids`, `allowed_token_ids` and inputs sent as token ids (`prompt`, embeddings `input`, rerank and score inputs, `label_token_ids`) must be below this (unset: below 2^31) |
+| `VLLM_PROXY_MAX_MODEL_NAME_CHARS` | No | `256` | Max characters in `model` (also the multipart `model` field) |
+| `VLLM_PROXY_MAX_CONTENT_PART_UUID_CHARS` | No | `256` | Max characters in a content part `uuid` |
+| `VLLM_PROXY_MAX_IMAGE_N` | No | `10` | Image routes: max `n` |
+| `VLLM_PROXY_MAX_IMAGE_SIDE` | No | `2048` | Image routes: max width and height in `size` |
+| `VLLM_PROXY_MAX_IMAGE_STEPS` | No | `100` | Image routes: max `num_inference_steps` |
+| `VLLM_PROXY_MAX_REGEX_NESTED_PRODUCT` | No | `64` | Structured-output regexes (also JSON-schema `pattern`): max outer bound × variable-range bound nested inside it; an unbounded outer repeat around a variable-range one is refused |
+| `VLLM_PROXY_MAX_REGEX_STAR_REPEAT` | No | `32` | Structured-output regexes: max bound of a group that contains `*`, `+` or `{m,}` |
+| `VLLM_PROXY_MAX_REGEX_BOUND` | No | `10000` | Structured-output regexes: max single repeat bound |
+| `VLLM_PROXY_MAX_REGEX_CHARS` | No | `8192` | Structured-output regexes: max pattern length |
+| `VLLM_PROXY_ALLOW_GRAMMAR` | No | off | Forward EBNF grammars (`grammar`, `ebnf`, `guided_grammar`); off = 400 |
+| `VLLM_PROXY_REJECT_LOCAL_MEDIA_URLS` | No | on | Media URLs must be http, https or data, on every route that forwards a JSON body: the `image_url`, `input_image`, `image`, `image_pil`, `audio_url`, `video_url` and `video` keys of chat content parts (whatever their `type`), of chat messages in embeddings `input`, of embeddings items and of rerank/score inputs (`src/media_refs.rs`). Independent of `VLLM_PROXY_INLINE_MEDIA` |
+| `VLLM_PROXY_INLINE_MEDIA` | No | off | The proxy downloads every http(s) image and audio URL in those same places, on every route that forwards a JSON body, and forwards `data:` URLs, so the engine never fetches a URL (`src/media_inline.rs`). Fail closed: an item that cannot be fetched, is too large or is not a supported format, a remote video, a media value that is not a URL and any other scheme are a 400, and a body that would still hold a non-`data:` media URL is refused. The fetch refuses loopback, private, link-local and other non-public addresses (literal or resolved, on every redirect hop) and honors `VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS`. Limits (shared by all routes): `VLLM_PROXY_INLINE_MEDIA_TIMEOUT_SECS` (10), `_DEADLINE_SECS` (30), `_MAX_ITEMS` (32), `_MAX_IMAGE_BYTES` (10 MiB), `_MAX_AUDIO_BYTES` (25 MiB), `_MAX_TOTAL_BYTES` (50 MiB), `_MAX_IMAGE_PIXELS` (25M), `_MAX_REDIRECTS` (3), `_MAX_CONCURRENCY` (32) |
+| `VLLM_PROXY_STRIPPED_REQUEST_FIELDS` | No | see `DEFAULT_STRIPPED_FIELDS` | Top-level keys (and form fields) removed before dispatch. Default: `kv_transfer_params`, `ec_transfer_params`, `vllm_xargs`, `session_params`, `mm_hashes`, `return_hidden_states`, `custom_logit_processor`. Set to replace the list; empty = none. Not separately configurable (on with the guard): `min_tokens` <= `max_tokens`, `logprob_start_len` >= -1, `top_k` of -1 or 0 to 2^31-1, finite sampling floats |
+| `VLLM_PROXY_USAGE_REPORT_TRANSPORT` | No | `http` | Where usage reports go. `http`: `POST {CLOUD_API_URL}/v1/internal/usage` with `CLOUD_API_USAGE_TOKEN`. `sqs`: a `SendMessage` to the usage queue, each report a usage envelope signed with SigV4; this needs `VLLM_PROXY_USAGE_REPORT_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL`, and not `CLOUD_API_URL` or the usage token. Any other value fails startup. If the usage queue fails its startup check and `CLOUD_API_URL` and `CLOUD_API_USAGE_TOKEN` are set, the process falls back to `http` for its life (ERROR log; `inference_proxy_usage_report_transport_info{transport="http"}` is 1); without them it refuses to start |
+| `VLLM_PROXY_USAGE_REPORT_SQS_URL` | With `sqs` | unset | The usage queue's URL |
+| `VLLM_PROXY_USAGE_REPORT_SQS_REGION` | No | `us-east-1` | The usage queue's AWS region (letters, digits and hyphens) |
+| `VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT` | No | unset | Replaces the regional SQS endpoint, for a local emulator |
+| `VLLM_PROXY_AWS_CREDENTIALS_URL` | With `sqs` | unset | Base URL of an instance-metadata (IMDSv2) credentials endpoint, e.g. `http://127.0.0.1:9911`; on a gateway host, `aws_signing_helper serve` on localhost. The gateway fetches a session token (`PUT /latest/api/token`), the role name (`GET /latest/meta-data/iam/security-credentials/`) and the credentials (`GET .../security-credentials/<role>`: `AccessKeyId`, `SecretAccessKey`, `Token`, `Expiration`). It is not the credentials path: a URL that already includes one is not served. It is the only source of credentials: there are no static keys |
+| `VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS` | No | off | Test environments only. By default the SQS URLs and the credentials URL must be `https`, except for a loopback host (an emulator on the same machine). `1` also accepts plain `http` to any host, for a compose network whose emulators have no TLS, and logs a warning at startup. Never set it where real credentials are served |
+| `VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS` | No | `5` | Timeout of one attempt at a usage report to cloud-api (1 to 300; above 5 requires `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT`). Usage reports are sent off the request path; with none of the `VLLM_PROXY_USAGE_REPORT_*` variables set a report gets one attempt of 5 s, as before. See [docs/gateway-mode.md](docs/gateway-mode.md#usage-report-delivery) |
+| `VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS` | No | `1` (`5` with `sqs`) | Attempts per usage report, the first one included (at most `10`). A timeout, a connection or transport error, a 5xx and a 429 are retried with the same bytes; any other 4xx is final. More than one requires `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` |
+| `VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS` | No | `500` | Backoff before the first retry of a usage report (at most 30000); doubled for each later one, at most 30 s, half of it random. Against a server that fails fast the backoff is all that spreads the attempts out: five attempts are used up in 4 to 8 s at `500`, in 33 to 65 s at `5000` |
+| `VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS` | No | `0` (none) | How long after its request completed a usage report may still be sent. An attempt only starts while its whole timeout fits before the deadline; a report that can no longer get one is dropped, logged and counted. Must be above the timeout |
+| `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` | No | `0` (no cap; `8` with `sqs`) | Usage reports in flight at once (at most 1000). The others wait in a bounded in-memory queue |
+| `VLLM_PROXY_USAGE_REPORT_MAX_QUEUED` | No | `10000` | Usage reports that may wait when the cap is reached (1 to 100000). When the queue is full the report that has waited longest is dropped, logged and counted |
+| `VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS` | No | `0` (no wait; `10` with `sqs`) | On SIGTERM, once every open request has ended, how long to wait for usage reports still queued or in flight before exiting (at most 600); the number left is logged. A stream still open delays the wait, so it does not replace retiring a process only after its reports are through |
+| `VLLM_PROXY_REASONING_OFF_EFFORT` | No | `none` | Gateway mode: the `reasoning_effort` sent for "as little reasoning as possible" when an aggregator asks for `reasoning.enabled: false`, an effort of `none`/`minimal`, or sends those as `reasoning_effort`. Other efforts in the `reasoning` object are copied. GLM-5.3 Flash needs `low` (its template only knows `low`/`high`; switched off outright it writes its reasoning as content) |
+| `VLLM_PROXY_SSE_KEEPALIVE_SECS` | No | `0` (off) | Emit `: keep-alive` SSE comments to the client whenever the upstream stream is silent this long. Not hashed into signatures — keep off where clients verify raw stream bytes |
+| `VLLM_PROXY_ADMISSION_TIER_BORROWING` | No | off | Let base hosts share the global admission budget using configured tier counts; requires admission, both tiers, and a positive long-host ceiling |
+| `VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST` | No | `0` | Long-host ceiling when borrowing is enabled; does not reserve global slots |
+| `VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT` | No | `0` (none) | Budget slots kept for requests bound for the long tier. Everything else is admitted only while fewer than `budget - reserve` such requests are in flight (refused with reason `long_reserve`), and the base hosts share that smaller number. Keep the reserve at or below the long hosts' aggregate per-host bound; any excess only reduces the base allowance. Requires borrowing; must be below the starting budget |
+| `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` | No | `0` (off) | Gateway mode: ceiling on chat/completions requests in flight across the fleet. Beyond it, and while the lane looks overloaded (see below), new requests get `429` + `Retry-After` before anything is sent upstream (`admission.rs`) |
+| `VLLM_PROXY_ADMISSION_START_INFLIGHT` | No | = max | Budget at start-up; it ramps by `VLLM_PROXY_ADMISSION_RAMP_STEP` (default `8`) every `VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS` (default `1800`) up to the maximum, but only after an interval without an overload signal |
+| `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | No | `30000` (`0` = off) | Refuse new lane work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. A request that ends before generating counts with the time it waited |
+| `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | No | `10` | A backend that rejected at engine admission (queue full / priority abort) within this many seconds is steered around while other hosts have room; when every healthy backend did, new lane work is refused |
+| `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` | No | `1` | Engine-reported queue depth (from `VLLM_BACKEND_PROBE_URLS`) at or above which a backend counts as saturated for placement and the fleet-wide queue refusal |
+| `VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS` | No | `2` | `Retry-After` value on admission refusals |
+| `VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT` | No | `false` | Keep a conversation pinned to its healthy backend when that backend is at its per-host limit (admission share or `VLLM_BACKEND_MAX_INFLIGHT`) and refuse the request with a 429 (reason `pinned_host_limit`) instead of moving the pin to a host without its prefix cache. An unhealthy, queueing or out-of-tier pin still moves, and an honoured replica hint still re-pins the conversation. In list mode this is the default of each model's `affinity_hold_at_limit` |
+| `VLLM_BACKEND_CONNECT_FAILOVER` | No | `false` | Retry a chat/completions request once on another healthy backend when the connection to the chosen one fails before anything was sent; the unreachable backend leaves the rotation until the health checker sees it again and a pinned conversation follows the request. HTTP errors, queue-full included, are never retried |
+| `VLLM_BACKEND_MAX_INFLIGHT` | No | `0` (unbounded) | Pool proxy: at most this many chat/completions requests in flight per backend. When every healthy backend is at the bound the request is refused with 429 `overloaded` (`Retry-After`) instead of being sent, so the limit is a refusal, not slower streams. Size it at the concurrency where the engine's per-token latency is still acceptable, with the engine's `--max-num-seqs` at or above it. Not with `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` |
+| `VLLM_BACKEND_PROBE_URLS` | No | empty | Gateway mode: one plain-HTTP base URL per backend (same order as `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's running and queued requests. New conversations go to the least-loaded engine, a host whose queue is at or above `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` (default 1) is steered around, and when every host queues new lane work gets 429. Empty = the gateway's own counts only |
+| `VLLM_BACKEND_PROBE_INTERVAL_SECS` | No | `2` | Poll interval for the probes; a sample older than three intervals counts as unknown |
+| `VLLM_BACKEND_LONG_CONTEXT_URLS` | No | empty | Gateway mode: backends of the long-context tier — the same hosts' handle URLs under the model's `-long` model-proxy domain — appended to the pool after `VLLM_BACKEND_URLS` so their indexes do not move. Requests estimated above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` are placed there, everything else on the base backends. Mutually exclusive with `VLLM_DATA_PARALLEL_SIZE` |
+| `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS` | No | empty | One engine-load probe base URL per long-context backend, same order. Required when `VLLM_BACKEND_PROBE_URLS` is set, empty when it is not |
+| `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | No | `0` (off) | Estimated input tokens above which a request goes to the long-context tier, using cloud-api's own routing estimate (text, tool calls and tool definitions at bytes/4 with its 1.2 safety factor, plus a flat cost per media part, per-message template overhead and the reserved output window; `prompt` token ids counted exactly). By default a tier with no healthy backend falls back to the other one (`VLLM_BACKEND_TIER_STRICT` turns that off); a full one refuses with 429. Not combinable with `WEB_CONTEXT_SEARCH_URL` |
+| `VLLM_BACKEND_TIER_STRICT` | No | `false` | Isolate the context tiers in both directions instead of falling back: a request whose tier has no healthy backend is refused rather than placed on the other one — 429 with `Retry-After` when admission is enabled (`admission_rejections_total{reason="tier_unavailable"}`), 503 (`error_type: "tier_unavailable"`) when it is not. Only meaningful with `VLLM_BACKEND_LONG_CONTEXT_URLS` set; without one it is ignored (a startup warning is logged) |
+| `VLLM_IMAGES_URL` | No | `{base}/v1/images/generations` | Override images endpoint |
+| `VLLM_IMAGES_EDITS_URL` | No | `{base}/v1/images/edits` | Override image edits endpoint |
+| `VLLM_TRANSCRIPTIONS_URL` | No | `{base}/v1/audio/transcriptions` | Override transcriptions endpoint |
+| `VLLM_RERANK_URL` | No | `{base}/v1/rerank` | Override rerank endpoint |
+| `VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE` | No | `2` | Concurrent `/v1/rerank` requests one Cloud API organization + workspace may run; more is a `429` with `Retry-After` before dispatch. At least 1 |
+| `VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT` | No | `16` | Concurrent `/v1/rerank` requests all Cloud API keys together may run. At least 1 |
+| `VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED` | No | `16` | Concurrent `/v1/rerank` requests all config tokens together may run. At least 1. `DIRECT + TRUSTED` is the most the rerank engine is asked to run at once: keep it within the concurrency the engine serves at an acceptable latency |
+| `VLLM_SCORE_URL` | No | `{base}/v1/score` | Override score endpoint |
+| `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis URL for opt-in signed host-frame state publishing |
+| `REPLICA_STATE_HOST_ID` | Yes, if the URL is set | — | Host identifier used in Redis keys and every published frame |
+| `REPLICA_STATE_REDIS_CA_CERT` | No | unset | PEM CA the Redis TLS certificate chains to (`rediss://` only); used for Redis instead of the system trust store. Literal `\n` accepted |
+| `REPLICA_STATE_INTERVAL_MS` | No | `500` | Publish interval in ms; must be within `200..=2000` (otherwise the feature is disabled with an error) |
+
+`x-nearai-replica: <index>` (the backend's position in `VLLM_BACKEND_URLS`, then the long-context URLs) is honoured only from callers using the proxy's `TOKEN` (same as `X-NearAI-Priority`), under the guard above. It is ignored for API-key callers. Metrics: `placement_hint_honored_total`, `placement_hint_overridden_total{reason}`.
+
+### Server-side web search
+
+A `/v1/chat/completions` request whose only tool is
+`{"type":"web_context_search"}` runs a server-side tool loop against the Brave
+LLM Context API. It requires `stream: true` and the variables below; otherwise
+it is refused with 400.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `WEB_CONTEXT_SEARCH_URL` | If web search is used | — | Brave LLM Context endpoint |
+| `WEB_CONTEXT_SEARCH_API_KEY` | If web search is used | — | Brave LLM Context API key |
+| `BRAVE_LLM_CONTEXT_API_KEY` | No | — | Alias for `WEB_CONTEXT_SEARCH_API_KEY` |
+| `AGENT_LOOP_MAX_ITERATIONS` | No | `5` | Caps `web_context_search` tool calls per request |
+| `WEB_CONTEXT_SEARCH_TIMEOUT_SECS` | No | `30` | Timeout for one search call |
+
+## Running
+
+```bash
+# Dev mode (random signing keys, no TEE required)
+DEV=1 MODEL_NAME=my-model TOKEN=secret cargo run
+
+# Production (requires dstack TEE environment)
+MODEL_NAME=my-model TOKEN=secret cargo run --release
+```
+
+The server listens on `0.0.0.0:8000` by default (configurable via `LISTEN_PORT`).
+
+## Building
+
+The Docker image (`./build-image.sh`) is a slim Ubuntu 22.04 runtime with no vLLM or CUDA; its apt and pip inputs are pinned in `pinned-packages-builder.txt`, `pinned-packages-runtime.txt` and `attestation-constraints.txt` (see the Dockerfile header). To build only the binary:
+
+```bash
+cargo build --release
+```
+
+The Docker image is built with `./build-image.sh` (or `make build`, which also
+loads it into the local Docker daemon as `vllm-proxy-rs:latest`); see
+[Reproducible build & verification](#reproducible-build--verification).
+
+## Reproducible build & verification
+
+The published image, `nearaidev/vllm-proxy-rs`, is reproducible: rebuilding a
+commit gives the same image digest, bit for bit. External verifiers rely on this
+to check that a deployed proxy runs the source it claims to run.
+
+### What external verifiers do
+
+Every deployment pins the proxy image by digest, so each served model runs one
+image built from one commit of this repository. For each model, a verifier
+records that source commit and then:
+
+1. Checks the image's build provenance. `build.yml` publishes a GitHub artifact
+   attestation and a keyless cosign signature for every image it pushes, and
+   both name the source commit.
+2. Rebuilds the commit from a fresh clone. The only inputs it sets are two
+   environment variables, and each image rebuild gets 60 minutes:
+
+   ```bash
+   git clone https://github.com/nearai/inference-proxy && cd inference-proxy
+   git checkout <commit>
+   ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh
+   tar -xOf oci.tar index.json | jq -r '.manifests[0].digest'   # must equal the deployed digest
+   ```
+
+To find the commit behind a published digest:
+
+```bash
+gh api /repos/nearai/inference-proxy/attestations/sha256:<hex> \
+  --jq '.attestations[0].bundle.dsseEnvelope.payload' | base64 -d \
+  | jq -r '.predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit'
+```
+
+### The contract
+
+- The command above, run on a fresh clone of a published commit, must produce
+  the published digest: today, and when the commit is rebuilt months later.
+- **Never add a required build environment variable or argument without
+  coordinating with external verifiers first.** Their build environment is
+  fixed. A new Dockerfile build arg must default to the value CI builds with.
+- `build-image.sh` writes `./oci.tar`, which holds exactly one image manifest,
+  and prints its digest. Its default path needs `docker` with buildx, `git`,
+  `jq` and `tar`. It must not depend on `skopeo`, which only `--push` uses
+  (some verifier environments replace it with a stub). `LOAD_IMAGE=1` also
+  loads the image into the local Docker daemon; the digest is the same.
+- Check out with umask 022, the default for CI runners and root. A file the
+  Dockerfile copies without `--chmod` keeps its checkout mode in the image, so
+  a clone made with umask 0002 (the default for many interactive Ubuntu
+  accounts) can give a different digest.
+
+### Expected rebuild time
+
+Two things set the rebuild time: the builder stage (Ubuntu packages, Rust
+toolchain, cargo build) and the size of the runtime base image, which is
+downloaded, unpacked and exported in full. With the vLLM-based runtime image
+(September 2026), a rebuild with no cached layers took 4 to 5 minutes on a
+24-thread x86_64 machine with a 10 Gbit/s link, and about 7 minutes on our CI
+hosts. Downloading and unpacking the 12.5 GB base took about 1.5 minutes, in
+parallel with the builder stage, and writing the 12.5 GB archive 1.3 to 2
+minutes. Slow package mirrors add minutes, and shared, busy hosts have needed
+close to 30 minutes. The verifier-parity job below reports the time of every
+rebuild in its run summary and warns above 30 minutes.
+
+### How CI checks it
+
+`reproducible-build.yml` runs on every merge to `main` that touches a build
+input, weekly on `main` (Mondays 03:00 UTC, to catch drift in the archives and
+registries the build reads), and on manual dispatch:
+
+- two builds in parallel, normally on two different hosts, and two in a row on
+  one host, whose archives must be identical byte for byte;
+- a verifier-parity rebuild: a fresh `git clone` of the commit under umask 022,
+  `env -i PATH=… HOME=… ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh`
+  with a 60-minute limit, digest read from `index.json`;
+- every digest must match the others and the digest `build.yml` published for
+  the same commit (read from its one successful `Reproducible Docker Image`
+  job, and for `main` also from the `staging-<date>-<sha>` tag on Docker Hub).
+  Auxiliary `Security audit` checks are excluded because they have no
+  downloadable logs;
+- a pins guard: one build runs with `LOAD_IMAGE=1`, and every committed
+  `pinned-packages-*.txt` must equal the package list that build installed.
+
+Failures on `main` post an alert to Slack. To check a branch before merging,
+dispatch `build.yml` on it first (so there is a published digest to compare
+with), then `reproducible-build.yml`:
+
+```bash
+gh workflow run build.yml --ref <branch> -R nearai/inference-proxy
+gh workflow run reproducible-build.yml --ref <branch> -R nearai/inference-proxy
+```
+
+### Hermetic inputs and how to bump them
+
+Everything the build downloads is pinned; the Dockerfile header describes each
+pin. Every bump changes the image digest, which is expected: bump in a pull
+request and dispatch `reproducible-build.yml` on its branch.
+
+| Input | Pinned in | How to bump |
+|---|---|---|
+| Base images | `FROM …@sha256:` lines in `Dockerfile` | Replace the digest (`docker buildx imagetools inspect <image>:<tag>`), then regenerate the pin files. |
+| Ubuntu packages | `UBUNTU_SNAPSHOT` in `Dockerfile`, plus the pin files | Pick a snapshot timestamp in the past (`YYYYMMDDTHHMMSSZ`; the service also answers for future timestamps, whose content is not frozen yet), check that `https://snapshot.ubuntu.com/ubuntu/<timestamp>/dists/<suite>/InRelease` exists for every suite the Dockerfile uses, then regenerate the pin files. |
+| Pin files | `pinned-packages-*.txt`, one per stage that installs Ubuntu packages | Empty them (`: > pinned-packages-builder.txt`), run `LOAD_IMAGE=1 ENABLE_NV_ATTESTATION_SDK=1 ./build-image.sh`, copy each `pinned-packages-*.resolved.txt` over its committed file, rebuild, and check that `diff -u` between each pair is empty (the CI pins guard runs the same diff). Always use `ENABLE_NV_ATTESTATION_SDK=1`: its package set includes the other one. |
+| libnvat | `LIBNVAT_VERSION` in `Dockerfile` | Pick a version listed in NVIDIA's `ubuntu2204` repository index, then regenerate the pin files. |
+| rustup | `RUSTUP_VERSION`, `RUSTUP_INIT_SHA256` in `Dockerfile` | Take the version from `https://static.rust-lang.org/rustup/release-stable.toml`, download `rustup-init` for it, hash it yourself and compare with the published `rustup-init.sha256`. |
+| Rust toolchain | `--default-toolchain` in `Dockerfile` | Change the version. Published toolchain releases never change. |
+| NVIDIA apt keyring | `CUDA_KEYRING_SHA256` in `Dockerfile` | `sha256sum` of the new `cuda-keyring` .deb. |
+| Python packages | `NV_ATTESTATION_SDK_VERSION`, `NV_PPCIE_VERIFIER_VERSION` in `Dockerfile`, `attestation-constraints.txt` | Regenerate the constraints with the recipe in the file header. |
+| Rust crates | `Cargo.lock` (with checksums) | `cargo update`. |
+| BuildKit | `BUILDKIT_IMAGE` in `build-image.sh` (tag and digest) | BuildKit versions serialize layers differently, so a new version also changes the digest. |
+
+### What the Ubuntu snapshot pin guarantees
+
+- The snapshot service keeps each dated archive immutable:
+  `https://snapshot.ubuntu.com/ubuntu/<timestamp>` serves the Ubuntu archive
+  as it was at that time, and apt checks every package it downloads against
+  that snapshot's indexes, which are signed with Ubuntu's archive key.
+  Installing from the same timestamp gives the same versions and the same files.
+- The committed exact versions are the second check. apt holds every package at
+  the version listed in `pinned-packages-*.txt` (pin priority 1001): it installs
+  that version or fails, never another one, and the CI pins guard compares what
+  was installed with the committed list.
+
+All APT stages use up to five command attempts, with 30-, 60-, 120- and
+240-second waits between attempts and 30-second HTTP/HTTPS timeouts, on top of
+APT's own per-file retries, so a snapshot.ubuntu.com outage of a few minutes
+does not fail the build. Exhausted retries, incomplete package indexes, missing
+packages and checksum mismatches still fail the build.
+
+What it does not guarantee:
+
+- Availability. If the snapshot service stops serving a timestamp, commits that
+  use it can no longer be rebuilt. The build fails; it does not silently
+  produce a different image. The same holds for the base images on Docker Hub,
+  crates.io, the Rust release server, NVIDIA's repository and PyPI.
+- Byte identity beyond the archive signatures. The pin files record versions,
+  not package hashes: we trust the snapshot service to keep serving the same
+  signed indexes for a timestamp, and the rebuilt digest is the final check.
+- Inputs outside the snapshot. NVIDIA's apt repository has no snapshot service
+  (libnvat is pinned to an exact version; if NVIDIA dropped it, older commits
+  would stop building). Python packages are pinned by version, not by hash, and
+  a project can add files to an existing version. The throwaway `ca-bootstrap`
+  stage installs `ca-certificates` from the live Ubuntu archive, but only its CA
+  bundle is used, to reach the snapshot over TLS, and nothing from that stage
+  reaches the image. Any stage that still installs from the live archive is
+  called out in the Dockerfile header.
+
+## Testing
+
+```bash
+cargo test
+```
+
+The suite includes unit tests for signing, cache, config, errors,
+attestation helpers, SSE parsing, and integration tests
+with wiremock mock backends for cryptographic signature verification,
+multipart endpoints, streaming completions, E2EE, and web tools.
+
+## Project Structure
+
+```
+src/
+  lib.rs              # Public module exports, AppState, request ID middleware
+  main.rs             # Entry point, server startup, graceful shutdown
+  config.rs           # Env var configuration
+  error.rs            # AppError -> OpenAI-style JSON error responses
+  types.rs            # SignedChat, AttestationReport, SignatureResponse
+  signing.rs          # ECDSA (secp256k1) + Ed25519 signing, key derivation
+  attestation.rs      # TDX + GPU attestation report generation
+  cache.rs            # moka in-memory cache with TTL
+  proxy.rs            # Generic proxy helpers (JSON, streaming SSE, multipart)
+  auth.rs             # Bearer token auth extractor
+  routes/
+    mod.rs            # Router assembly
+    health.rs         # GET /, GET /version
+    chat.rs           # POST /v1/chat/completions
+    completions.rs    # POST /v1/completions
+    passthrough.rs    # embeddings, rerank, score, images, audio, tokenize
+    signature.rs      # GET /v1/signature/{chat_id}
+    attestation.rs    # GET /v1/attestation/report
+    metrics.rs        # GET /v1/metrics, GET /v1/models
+tests/
+  integration.rs      # Integration tests with wiremock
+```
+
+## Signing
+
+Every signed response produces a `SignedChat` cached by response ID:
+
+```json
+{
+  "text": "{sha256_request}:{sha256_response}",
+  "signature_ecdsa": "0x{r}{s}{v}",
+  "signing_address_ecdsa": "0x{ethereum_address}",
+  "signature_ed25519": "{hex_signature}",
+  "signing_address_ed25519": "{hex_public_key}"
+}
+```
+
+- **ECDSA**: EIP-191 `personal_sign` format, recoverable secp256k1 signature
+- **Ed25519**: Direct message signing, 64-byte signature
+
+`GET /v1/signature/{id}` with a configured `TOKEN` returns any cached signature. With a
+Cloud API key (`sk-`) it returns only signatures of responses served to a key of the same
+organization and workspace; any other id, including one cached for a `TOKEN` caller,
+answers 404 like an unknown id. The cache is per process: a signature is only found on
+the instance that served the response.
+
+In production, signing keys are derived from dstack KMS (`DstackClient::get_key`). In dev mode (`DEV=1`), random keys are generated at startup.

@@ -1,0 +1,688 @@
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use tracing::error;
+
+use crate::proxy::parse_upstream_error;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AppError {
+    #[error("upstream error")]
+    Upstream { status: StatusCode, body: Bytes },
+
+    #[error("upstream request failed with status {status}")]
+    UpstreamParsed {
+        status: StatusCode,
+        message: String,
+        error_type: String,
+    },
+
+    #[error("{0}")]
+    BadRequest(String),
+
+    /// A request field outside the bounds the proxy forwards
+    /// (`request_guard.rs`): OpenAI's 400 shape with `param` set. The message
+    /// never echoes the caller's value.
+    #[error("{message}")]
+    InvalidParam { param: String, message: String },
+
+    #[error("unauthorized")]
+    Unauthorized,
+
+    /// The key is valid but its organization may not use this deployment
+    /// (`VLLM_PROXY_ALLOWED_ORG_IDS`).
+    #[error("forbidden")]
+    Forbidden,
+
+    #[error("insufficient credits")]
+    InsufficientCredits,
+
+    #[error("usage accounting unavailable")]
+    BillingUnavailable,
+
+    #[error("{0}")]
+    NotFound(String),
+
+    #[error("payload too large (max {max_size} bytes)")]
+    PayloadTooLarge { max_size: usize },
+
+    #[error("rate limit exceeded")]
+    RateLimited,
+
+    /// Refused rather than queued: 429 with `Retry-After`. Lane admission
+    /// (`admission.rs`) refuses before anything is sent upstream; a missed
+    /// first-token deadline (`proxy.rs`) refuses a request that was already
+    /// dispatched, dropping the upstream attempt with it.
+    #[error("overloaded ({reason})")]
+    Overloaded {
+        reason: &'static str,
+        retry_after_secs: u64,
+    },
+
+    /// Strict context tiers (`VLLM_BACKEND_TIER_STRICT`, `context_tier.rs`)
+    /// with admission disabled: the request's tier has no healthy backend at
+    /// all, and there is no `Permit` to build the 429 `Overloaded` shape
+    /// from. A 503 keeps it distinct from `upstream_unreachable` (a transport
+    /// failure) and from a 4xx (nothing was wrong with the request); a
+    /// dedicated variant (rather than reusing `UpstreamParsed`) keeps
+    /// `http_errors_total{error_type}` at `"tier_unavailable"` instead of the
+    /// generic `"upstream"` every `UpstreamParsed` response is labelled with.
+    #[error("no healthy backend in the requested context tier")]
+    TierUnavailable { retry_after_secs: u64 },
+
+    /// Gateway list mode (`model_list.rs`): the request's `model` is not one
+    /// of the configured ids (`Some`), or is missing or not a string (`None`).
+    /// The message leaves the name out: it is the caller's string and must
+    /// not reach a log line.
+    #[error("model not found")]
+    ModelNotFound { model: Option<String> },
+
+    #[error("{0}")]
+    Internal(#[from] anyhow::Error),
+}
+
+pub(crate) const E2EE_UPSTREAM_MESSAGE: &str = "Upstream request failed";
+
+/// Only protocol error categories may accompany an encrypted request's failure.
+pub(crate) fn safe_upstream_error_type(error_type: &str) -> &str {
+    match error_type {
+        "invalid_request_error"
+        | "BadRequestError"
+        | "NotFoundError"
+        | "server_error"
+        | "upstream_error"
+        | "upstream_unreachable"
+        | "overloaded" => error_type,
+        _ => "upstream_error",
+    }
+}
+
+impl AppError {
+    pub(crate) fn for_encrypted_request(self, encrypted: bool) -> Self {
+        if !encrypted {
+            return self;
+        }
+        match self {
+            Self::Upstream { status, body } => {
+                let error_type = parse_upstream_error(&body)
+                    .map(|info| safe_upstream_error_type(&info.error_type).to_owned())
+                    .unwrap_or_else(|| "upstream_error".into());
+                // Keep the Upstream variant's status and Retry-After handling.
+                Self::Upstream {
+                    status,
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "error": {"message": E2EE_UPSTREAM_MESSAGE, "type": error_type}
+                    }))
+                    .expect("static error body is serializable")
+                    .into(),
+                }
+            }
+            Self::UpstreamParsed {
+                status, error_type, ..
+            } => Self::UpstreamParsed {
+                status,
+                message: E2EE_UPSTREAM_MESSAGE.into(),
+                error_type: safe_upstream_error_type(&error_type).into(),
+            },
+            other => other,
+        }
+    }
+}
+
+/// Longest requested model name echoed back in the `model_not_found` message.
+const MODEL_NOT_FOUND_ECHO_MAX_BYTES: usize = 256;
+
+/// `Retry-After` on an engine admission rejection rewritten to 429: the
+/// engine's queue drains in seconds, same as the gateway's own default.
+const ENGINE_REJECTION_RETRY_AFTER: &str = "2";
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, message, error_type) = match &self {
+            AppError::Upstream { status, body } => {
+                // Parse and sanitize upstream errors to prevent leaking user data
+                // (validation errors from SGLang/vLLM include conversation content
+                // in 'input' fields)
+                metrics::counter!("http_errors_total", "error_type" => "upstream").increment(1);
+                let (message, error_type) = match parse_upstream_error(body) {
+                    Some(info) => (info.message, info.error_type),
+                    None => {
+                        // Unparseable body — return generic message, never forward raw
+                        let msg = format!("Upstream request failed with status {status}");
+                        (msg, "upstream_error".to_string())
+                    }
+                };
+                // An engine admission rejection rewritten to 429 (queue full,
+                // or a queued request displaced by a higher-priority one) is
+                // back-pressure like the gateway's own refusals: same type,
+                // same Retry-After, so clients handle both the same way.
+                let overloaded = *status == StatusCode::TOO_MANY_REQUESTS;
+                let error_type = if overloaded {
+                    "overloaded".to_string()
+                } else {
+                    error_type
+                };
+                let sanitized_body = serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": error_type,
+                        "param": null,
+                        "code": null,
+                    }
+                });
+                let mut response = (*status, axum::Json(sanitized_body)).into_response();
+                if overloaded {
+                    response.headers_mut().insert(
+                        axum::http::header::RETRY_AFTER,
+                        axum::http::HeaderValue::from_static(ENGINE_REJECTION_RETRY_AFTER),
+                    );
+                }
+                return response;
+            }
+            AppError::UpstreamParsed {
+                status,
+                message,
+                error_type,
+            } => {
+                metrics::counter!("http_errors_total", "error_type" => "upstream").increment(1);
+                let body = serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": error_type,
+                        "param": null,
+                        "code": null,
+                    }
+                });
+                return (*status, axum::Json(body)).into_response();
+            }
+            AppError::ModelNotFound { model } => {
+                // OpenAI's answer for a model the caller cannot use, `code`
+                // included: clients and aggregators key on it.
+                metrics::counter!("http_errors_total", "error_type" => "model_not_found")
+                    .increment(1);
+                let message = match model.as_deref() {
+                    Some(model) if model.len() <= MODEL_NOT_FOUND_ECHO_MAX_BYTES => format!(
+                        "The model `{model}` does not exist or you do not have access to it."
+                    ),
+                    Some(_) => {
+                        "The requested model does not exist or you do not have access to it."
+                            .to_string()
+                    }
+                    None => "A `model` is required: set it to one of the ids listed by \
+                             /v1/models."
+                        .to_string(),
+                };
+                let body = serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                        "param": null,
+                        "code": "model_not_found",
+                    }
+                });
+                return (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
+            }
+            AppError::InvalidParam { param, message } => {
+                metrics::counter!("http_errors_total", "error_type" => "invalid_request_error")
+                    .increment(1);
+                let body = serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                        "param": param,
+                        "code": null,
+                    }
+                });
+                return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            }
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone(), "bad_request"),
+            AppError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "Invalid or missing Authorization header".to_string(),
+                "unauthorized",
+            ),
+            AppError::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "This API key's organization is not allowed to use this endpoint.".to_string(),
+                "forbidden",
+            ),
+            AppError::InsufficientCredits => (
+                StatusCode::PAYMENT_REQUIRED,
+                "Insufficient credits".to_string(),
+                "insufficient_credits",
+            ),
+            AppError::BillingUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Usage accounting is temporarily unavailable".to_string(),
+                "billing_unavailable",
+            ),
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone(), "not_found"),
+            AppError::PayloadTooLarge { max_size } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Request body too large. Maximum: {max_size} bytes"),
+                "payload_too_large",
+            ),
+            AppError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit exceeded. Please try again later.".to_string(),
+                "rate_limited",
+            ),
+            AppError::Overloaded { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "The endpoint is at capacity. Please retry later.".to_string(),
+                "overloaded",
+            ),
+            AppError::TierUnavailable { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No healthy backend in the requested context tier".to_string(),
+                "tier_unavailable",
+            ),
+            AppError::Internal(_) => {
+                error!(error_kind = "internal", "Internal server error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                    "server_error",
+                )
+            }
+        };
+
+        metrics::counter!("http_errors_total", "error_type" => error_type).increment(1);
+
+        let body = serde_json::json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": null,
+                "code": null,
+            }
+        });
+
+        let mut response = (status, axum::Json(body)).into_response();
+        let retry_after_secs = match self {
+            AppError::Overloaded {
+                retry_after_secs, ..
+            }
+            | AppError::TierUnavailable { retry_after_secs } => Some(retry_after_secs),
+            _ => None,
+        };
+        if let Some(retry_after_secs) = retry_after_secs {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
+    }
+}
+
+impl From<crate::admission::Rejected> for AppError {
+    fn from(rejected: crate::admission::Rejected) -> Self {
+        AppError::Overloaded {
+            reason: rejected.reason.as_str(),
+            retry_after_secs: rejected.retry_after.as_secs().max(1),
+        }
+    }
+}
+
+impl AppError {
+    /// See `AppError::TierUnavailable`. `retry_after_secs` should be the same
+    /// value the admission path's own 429 would carry
+    /// (`Config::admission_retry_after_secs`) so a caller sees one consistent
+    /// number for this deployment regardless of which refusal it hits.
+    pub fn tier_unavailable(retry_after_secs: u64) -> Self {
+        AppError::TierUnavailable { retry_after_secs }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    async fn response_to_json(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = response.into_body();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn test_invalid_param_error() {
+        let err = AppError::InvalidParam {
+            param: "top_logprobs".to_string(),
+            message: "`top_logprobs` must be at most 20.".to_string(),
+        };
+        let (status, json) = response_to_json(err.into_response()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["param"], "top_logprobs");
+        assert_eq!(
+            json["error"]["message"],
+            "`top_logprobs` must be at most 20."
+        );
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_bad_request_error() {
+        let err = AppError::BadRequest("invalid field".to_string());
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["message"], "invalid field");
+        assert_eq!(json["error"]["type"], "bad_request");
+        assert!(json["error"]["param"].is_null());
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_model_not_found_is_openai_shaped_and_never_displays_the_name() {
+        let err = AppError::ModelNotFound {
+            model: Some("org/unknown".to_string()),
+        };
+        // `Display` is what a log line would carry.
+        assert_eq!(err.to_string(), "model not found");
+        let (status, json) = response_to_json(err.into_response()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            json["error"]["message"],
+            "The model `org/unknown` does not exist or you do not have access to it."
+        );
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["code"], "model_not_found");
+        assert!(json["error"]["param"].is_null());
+
+        // Missing or not a string: same status and code, nothing to echo.
+        let (status, json) =
+            response_to_json(AppError::ModelNotFound { model: None }.into_response()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"]["code"], "model_not_found");
+
+        // An oversized name is not echoed back.
+        let long = "m".repeat(MODEL_NOT_FOUND_ECHO_MAX_BYTES + 1);
+        let (_, json) = response_to_json(
+            AppError::ModelNotFound {
+                model: Some(long.clone()),
+            }
+            .into_response(),
+        )
+        .await;
+        assert!(!json["error"]["message"].as_str().unwrap().contains(&long));
+        assert_eq!(json["error"]["code"], "model_not_found");
+    }
+
+    #[tokio::test]
+    async fn test_overloaded_error_carries_retry_after() {
+        let err = AppError::Overloaded {
+            reason: "budget",
+            retry_after_secs: 2,
+        };
+        let response = err.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+        let (status, json) = response_to_json(response).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(json["error"]["type"], "overloaded");
+    }
+
+    #[tokio::test]
+    async fn test_tier_unavailable_error_carries_retry_after_and_distinct_type() {
+        let err = AppError::tier_unavailable(2);
+        let response = err.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+        let (status, json) = response_to_json(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // Distinct from `UpstreamParsed`/`Upstream`, which both label
+        // `http_errors_total{error_type="upstream"}` regardless of the
+        // parsed type — this refusal must be countable on its own.
+        assert_eq!(json["error"]["type"], "tier_unavailable");
+    }
+
+    #[tokio::test]
+    async fn test_upstream_429_is_overloaded_with_retry_after() {
+        let err = AppError::Upstream {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: Bytes::from_static(
+                br#"{"object":"error","message":"The request is aborted by a higher priority request.","type":"SERVICE_UNAVAILABLE","code":503}"#,
+            ),
+        };
+        let response = err.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+        let (status, json) = response_to_json(response).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(json["error"]["type"], "overloaded");
+        assert_eq!(
+            json["error"]["message"],
+            "The request is aborted by a higher priority request."
+        );
+
+        // Other upstream statuses keep the engine's type and carry no header.
+        let err = AppError::Upstream {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: Bytes::from_static(
+                br#"{"object":"error","message":"Model is loading","type":"ServiceUnavailable","code":503}"#,
+            ),
+        };
+        let response = err.into_response();
+        assert!(response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+        let (status, json) = response_to_json(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"]["type"], "ServiceUnavailable");
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_error() {
+        let err = AppError::Unauthorized;
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json["error"]["message"],
+            "Invalid or missing Authorization header"
+        );
+        assert_eq!(json["error"]["type"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn test_not_found_error() {
+        let err = AppError::NotFound("Chat id not found".to_string());
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"]["message"], "Chat id not found");
+        assert_eq!(json["error"]["type"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn test_payload_too_large_error() {
+        let err = AppError::PayloadTooLarge {
+            max_size: 10 * 1024 * 1024,
+        };
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            json["error"]["message"],
+            "Request body too large. Maximum: 10485760 bytes"
+        );
+        assert_eq!(json["error"]["type"], "payload_too_large");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_error() {
+        let err = AppError::RateLimited;
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            json["error"]["message"],
+            "Rate limit exceeded. Please try again later."
+        );
+        assert_eq!(json["error"]["type"], "rate_limited");
+    }
+
+    #[tokio::test]
+    async fn test_internal_error_hides_details() {
+        let err = AppError::Internal(anyhow::anyhow!("secret database password exposed"));
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // Should NOT leak the internal error message
+        assert_eq!(json["error"]["message"], "Internal server error");
+        assert_eq!(json["error"]["type"], "server_error");
+    }
+
+    #[tokio::test]
+    async fn test_upstream_parsed_error() {
+        let err = AppError::UpstreamParsed {
+            status: StatusCode::BAD_REQUEST,
+            message: "This model's maximum context length is 2048 tokens".to_string(),
+            error_type: "BadRequestError".to_string(),
+        };
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "BadRequestError");
+        assert_eq!(
+            json["error"]["message"],
+            "This model's maximum context length is 2048 tokens"
+        );
+        assert!(json["error"]["param"].is_null());
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_parsed_preserves_status_codes() {
+        for (code, expected_status) in [
+            (400, StatusCode::BAD_REQUEST),
+            (404, StatusCode::NOT_FOUND),
+            (422, StatusCode::UNPROCESSABLE_ENTITY),
+            (500, StatusCode::INTERNAL_SERVER_ERROR),
+            (501, StatusCode::NOT_IMPLEMENTED),
+        ] {
+            let err = AppError::UpstreamParsed {
+                status: StatusCode::from_u16(code).unwrap(),
+                message: "test".to_string(),
+                error_type: "TestError".to_string(),
+            };
+            let response = err.into_response();
+            assert_eq!(response.status(), expected_status, "status code {code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upstream_error_passthrough() {
+        let upstream_body = serde_json::json!({
+            "error": {"message": "model not found", "type": "not_found"}
+        });
+        let body_bytes = serde_json::to_vec(&upstream_body).unwrap();
+
+        let err = AppError::Upstream {
+            status: StatusCode::NOT_FOUND,
+            body: Bytes::from(body_bytes),
+        };
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"]["message"], "model not found");
+    }
+
+    #[tokio::test]
+    async fn test_error_response_is_openai_compatible() {
+        // All non-upstream errors should produce the standard OpenAI error shape
+        let err = AppError::BadRequest("test".to_string());
+        let response = err.into_response();
+        let (_, json) = response_to_json(response).await;
+
+        // Must have the "error" top-level key with sub-fields
+        assert!(json.get("error").is_some());
+        let error_obj = &json["error"];
+        assert!(error_obj.get("message").is_some());
+        assert!(error_obj.get("type").is_some());
+        assert!(error_obj.get("param").is_some());
+        assert!(error_obj.get("code").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_error_redacts_validation_input() {
+        let upstream_body = serde_json::json!({
+            "object": "error",
+            "message": "1 validation errors:\n  {'type': 'value_error', 'msg': 'bad', 'input': 'secret user conversation'}"
+        });
+        let body_bytes = serde_json::to_vec(&upstream_body).unwrap();
+
+        let err = AppError::Upstream {
+            status: StatusCode::BAD_REQUEST,
+            body: Bytes::from(body_bytes),
+        };
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("secret user conversation"));
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("value_error: bad"));
+        // Now produces OpenAI-compatible format
+        assert!(json["error"]["type"].is_string());
+        assert!(json["error"]["param"].is_null());
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_error_unparseable_body() {
+        let err = AppError::Upstream {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: Bytes::from("not json at all"),
+        };
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // Should return generic message, not the raw body
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Upstream request failed"));
+        assert!(!json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not json at all"));
+    }
+}

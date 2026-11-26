@@ -1,0 +1,179 @@
+# CLAUDE.md
+
+## Contribution privacy
+
+Keep contributions, including those prepared with AI agents, focused on the change and how it was tested. Before publishing, review all content and remove any confidential or sensitive information.
+
+## Build & Test
+
+```bash
+cargo build --release    # Release build
+cargo check              # Fast type-check
+cargo test               # Run all tests (116 unit + 77 integration)
+cargo test <test_name>   # Run a specific test
+cargo fmt                # Format code
+```
+
+No special env vars needed for tests — integration tests use wiremock and fixed signing keys.
+
+For changes that touch NVML, the libnvat SDK FFI, dstack TDX, or
+proxy-to-proxy contracts (e.g. `/internal/gpu_evidence`), `cargo test`
+isn't enough — see [docs/testing-on-cvm.md](docs/testing-on-cvm.md)
+for the real-CVM smoke-test recipe (build a branch image with
+`gh workflow run build.yml --ref <branch>`, deploy a 2-proxy stack
+inside a gpu0X CVM, probe both happy and leader-down paths).
+
+## Architecture
+
+This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy). It proxies OpenAI-compatible API requests to a vLLM/sglang backend, adding cryptographic signing and TEE attestation.
+
+**Key flow**: Request arrives -> auth check -> read body -> forward to backend -> hash request+response -> sign with ECDSA+Ed25519 -> cache signature -> return response.
+
+### Module map
+
+- `lib.rs` — `AppState` (shared state via Arc), `request_id_middleware`, public module exports
+- `config.rs` — `Config::from_env()`, all env vars loaded at startup
+- `signing.rs` — `EcdsaContext` (secp256k1 EIP-191), `Ed25519Context`, `SigningPair`
+- `proxy.rs` — `proxy_json_request()`, `proxy_streaming_request()`, `proxy_multipart_request()`, `proxy_simple()` — the core proxy+sign+cache helpers that routes delegate to
+- `cache.rs` — `ChatCache` wrapping moka with TTL, key format `{model}:chat:{id}`; each entry records the direct-key owner (`SignatureOwner`: org + workspace, from the request's `UsageReporter` via `proxy::signature_owner`). A config `TOKEN` reads every entry, an `sk-` key only its owner's (`SignatureReader`)
+- `attestation.rs` — `AttestationCache`, `generate_attestation()`, GPU evidence collection with retry/serialization, dstack TDX quotes
+- `auth.rs` — `RequireAuth` axum extractor (validates Bearer token)
+- `api_key_cache.rs` — `ApiKeyCache`: coalesces concurrent `sk-` key checks; later requests revalidate so revocation is observed
+- `routes/` — thin handlers that parse request, call proxy helpers
+- `replica_state/` — opt-in publishing of one signed host frame per tick to Redis (`spawn_replica_state_publisher`)
+- `usage_report.rs` — delivery of usage reports to cloud-api off the request path (`UsageReportDelivery`, one per process): per-attempt timeout, retries, a cap on reports in flight with a bounded queue, a drain at shutdown (`VLLM_PROXY_USAGE_REPORT_*`)
+- `model_list.rs` — gateway list mode (`VLLM_PROXY_MODEL_LIST_FILE`): the list file, one bundle per model (`ServedModel`), model selection (`model_for` → `ModelView`); `model_metrics.rs` holds the `model` label macros
+
+### Important patterns
+
+- `dstack-sdk` is on crates.io now (was previously a git dependency). Path: `dstack_sdk::dstack_client::DstackClient`
+- `generate_attestation()` takes `AttestationParams` struct + optional `&AttestationCache`
+- Attestation nonces are cryptographically bound to GPU evidence and TDX quotes — cannot cache across different nonces
+- Nonce-less attestation requests can be cached (caller accepts whatever nonce we generate)
+- GPU evidence collection spawns a Python subprocess calling NVIDIA's `cc_admin.collect_gpu_evidence_remote()` — serialized behind a semaphore to avoid NVML driver contention
+- `reqwest::multipart::Part::mime_str()` consumes self — use `.expect()` not `?` in chains
+- Streaming uses `tokio::spawn` + `mpsc` channel: background task hashes chunks and signs on stream completion
+- `strip_empty_tool_calls` in `routes/chat.rs` is a vLLM bug workaround (still needed as of vLLM v0.15.1)
+- `tool_calls::normalize_tool_call_arguments` repairs `tool_calls[].function.arguments` in history (empty, missing, double-encoded, non-object) before dispatch; SGLang otherwise 400s the whole request (nearai/inference-proxy#239)
+- `system_messages::merge_system_messages` (list mode, per model, `merge_system_messages: true`) rewrites a chat request with a `system` message after the first position into one leading `system` message holding all their text, for a chat template that 400s anything else. It never drops anything: a non-text part, an unknown content shape or two values for one extra field leave the request untouched. Runs after decryption, the repairs and the content policy, before the estimate and the affinity keys
+- Signed text format: `"{model_name}:{sha256_request}:{sha256_response}"` signed by both algos
+- `serde_json::to_string` matches Python's `json.dumps(separators=(",",":"))`
+- `serde_json` is built with `preserve_order`: a body the proxy parses and re-serializes keeps the caller's key order. Grammar-constrained engines write fields in the order of a schema's `properties`, so sorting them (the default `BTreeMap`) changed what the model generates
+
+### Dependencies to know about
+
+- `futures-util` — needed for `StreamExt` on reqwest byte streams
+- `http-body-util` — needed for `BodyExt::frame()` / `BodyExt::collect()` on axum Body
+- `k256` — secp256k1 ECDSA with `PrehashSigner` trait from `signature::hazmat`
+- `sha3` — Keccak256 for Ethereum address derivation and EIP-191
+
+## Code style
+
+- Run `cargo fmt` before committing
+- Error types in `error.rs` produce OpenAI-compatible JSON: `{"error": {"message": ..., "type": ..., "param": null, "code": null}}`
+- Internal errors hide details from clients (returns generic "Internal server error")
+- Named route upstream errors are passed through verbatim (status code + body)
+- `parse_upstream_error()` in `proxy.rs` handles both vLLM flat (`{"message":"..."}`) and nested (`{"error":{"message":"..."}}`) formats
+- Log upstream status and a bounded error kind; raw upstream error messages may contain request data
+- `request_id_middleware` wraps requests in a tracing span — all log lines automatically include `request_id`, `method`, `path`
+- Unit tests live in `#[cfg(test)] mod tests` within each source file
+- Integration tests in `tests/integration.rs` use `tower::ServiceExt::oneshot` with wiremock
+- When adding fields to `Config` or `AppState`, also update both `build_test_app_*` helpers in `tests/integration.rs`
+
+## Deployment
+
+- Docker image: `nearaidev/vllm-proxy-rs` (published with digest-pinned refs in cvm-conf)
+- The image build is reproducible and externally verified: `ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh` on a fresh clone must produce the digest CI published, and `reproducible-build.yml` checks exactly that. Never add a required build env var or argument without coordinating with external verifiers first. See README "Reproducible build & verification" for the contract, the pinned inputs and how to bump them.
+- Deployed via compose files in [nearai/cvm-compose-files](https://github.com/nearai/cvm-compose-files)
+- Each proxy instance needs: `MODEL_NAME`, `TOKEN`, `VLLM_BASE_URL`, `TLS_CERT_PATH`
+- Optional: `CLOUD_API_URL` (enables usage reporting + `sk-` API key auth via cloud-api), `LOG_FORMAT=json` (structured JSON logs)
+- Pre-dispatch image validation is enabled by default for chat-completions image inputs. `VLLM_PROXY_IMAGE_VALIDATION_DISABLED=1` disables it. Tunables: `VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS` (default 5), `VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES` (8192), `VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY` (8), `VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS` (default off), `VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS` (exact remote `image_url` host allowlist checked before fetch and on every redirect; falls back to `VLLM_ALLOWED_MEDIA_DOMAINS` when unset; Gemma-4 defaults to `prod-files-secure.s3.us-west-2.amazonaws.com`; explicitly set empty to disable the proxy-side domain restriction), `VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB` (default off; `1` forces strict non-RGB PNG/JPEG rejection. Gemma-4 model names still auto-reject observed one-channel PNG/JPEG crash inputs).
+- `VLLM_PROXY_INLINE_MEDIA=1` (default off, `media_inline.rs`): the proxy downloads every http(s) image and audio URL in a forwarded JSON body and forwards `data:` URLs, so the engine can run with no route out. Every route that forwards a JSON body runs it with the field rules through `forward_body::prepare` (chat runs the two halves separately); `routes::POST_ROUTES` declares each POST route's body handling, and media is found by key, whatever the part `type`, in chat parts, embeddings inputs and rerank/score inputs (`media_refs.rs`). Fail closed: a remote item that can't be fetched, is too large or isn't JPEG/PNG/WebP/GIF (images) or WAV/MP3/FLAC/OGG/WebM/M4A (audio) is a 400, and so are a remote video, a value that is not a URL and any other scheme. `input_audio` and `data:` items only get the size caps. Runs before image validation and reuses its fetch client, host rules and domain allowlist. Limits: `VLLM_PROXY_INLINE_MEDIA_TIMEOUT_SECS` (10, per item including redirects), `_DEADLINE_SECS` (30, per request), `_MAX_ITEMS` (32), `_MAX_IMAGE_BYTES` (10 MiB), `_MAX_AUDIO_BYTES` (25 MiB), `_MAX_TOTAL_BYTES` (50 MiB), `_MAX_IMAGE_PIXELS` (25M, from the header; an image whose size cannot be read is refused), `_MAX_REDIRECTS` (3), `_MAX_CONCURRENCY` (32). Inlining grows the forwarded body, so pair it with a larger `VLLM_PROXY_MAX_REQUEST_SIZE` only if clients send large inline media themselves.
+- `ATTESTATION_CACHE_TTL` (default 300s) — TTL for cached nonce-less attestation reports; background refresh runs at half-TTL
+- `DSTACK_SOCKET_PATH` (default `/var/run/dstack.sock`) — probed by `GET /healthz` so upstream load balancers (e.g. model-proxy) can detach this instance when the dstack guest-agent socket is unreachable. `/v1/models` alone won't catch this failure mode — sglang/vLLM keep serving while `/v1/attestation/report` silently 500s. The backend leg of `/healthz` probes `/health` (not `/v1/models`) since `/v1/models` serializes against the OpenAI request loop and can stall for >1s during prefill, producing spurious 503s on otherwise-healthy hosts.
+- Image base: slim Ubuntu 22.04 runtime, no vLLM/CUDA; apt and pip inputs pinned in `pinned-packages-builder.txt`, `pinned-packages-runtime.txt` and `attestation-constraints.txt` (bump procedure in the Dockerfile header)
+
+### Gateway mode (fleet-wide, non-TEE)
+
+The proxy can also run outside a CVM in front of a whole model fleet — see
+[docs/gateway-mode.md](docs/gateway-mode.md). Membership is static
+(`VLLM_BACKEND_URLS` = model-proxy `-b<handle>` URLs, one per host, stable across
+redeploys), backend requests carry `VLLM_BACKEND_TOKEN` via the dedicated
+`AppState.backend_client` (never `http_client`, which talks to cloud-api), and
+`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, `VLLM_PROXY_SSE_KEEPALIVE_SECS`,
+`VLLM_PROXY_MAP_QUEUE_FULL_TO_429`, `VLLM_PROXY_STREAM_ERROR_PEEK_MS`,
+`VLLM_PROXY_STREAM_COMMIT_MS` (commit the stream's 200 after N ms so keep-alives
+reach the client during a prefill; past it an upstream failure is an SSE error
+event, not a status), `VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS` + `_PER_1K_TOKENS_MS`
++ `_MAX_MS` (a streaming request with no first event by its deadline — counted
+from arrival, so auth counts — is refused with 429 and its upstream attempt
+dropped, instead of committing a 200 an aggregator cancels and books as our
+timeout; such requests skip the commit window),
+`NON_TEE_DEPLOYMENT` (404s the attestation, signature and GPU-evidence routes),
+`VLLM_BACKEND_HEALTH_PATH`, `LISTEN_ADDR`, `VLLM_PROXY_MODELS_DOCUMENT_URL` +
+`VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` (`/v1/models` = cloud-api's entry for
+`MODEL_NAME` plus declared `capacity`), `VLLM_PROXY_DISCOUNT_TO_USER` (requires
+the document URL; one fraction published as that entry's `discount_to_user`, also
+on the engine-list fallback, and sent on every usage report, so the listed and
+the billed price cannot drift), the lane admission budget
+(`VLLM_PROXY_ADMISSION_*`, `admission.rs`: in-flight budget with a ramp, per-host
+share, refusal on observed TTFT/engine back-pressure — 429 + `Retry-After` before
+dispatch), the long-context tier (`VLLM_BACKEND_LONG_CONTEXT_URLS` +
+`_PROBE_URLS` + `_ABOVE_TOKENS`, `context_tier.rs`: oversized prompts go to
+backends registered under the model's `-long` domain, estimated exactly as
+cloud-api's `context_routing::estimate_input` does it) and
+`VLLM_BACKEND_CONNECT_FAILOVER` (one retry on another backend, only when the
+connection itself fails) are the opt-in policies. All default to the
+in-CVM behavior. Request priority (`priority.rs`, no CVM config): every
+chat/completions body gets `priority` set by the proxy — the `X-NearAI-Priority`
+header value for callers using the config `TOKEN` (a gateway sets it from
+`VLLM_BACKEND_PRIORITY`), 0 for everyone else; client values are discarded.
+In gateway mode `reasoning.rs` maps an aggregator's `reasoning` object
+(`enabled: false`, `effort`) onto `reasoning_effort`; "off" is
+`VLLM_PROXY_REASONING_OFF_EFFORT` (`low` for GLM-5.3 Flash, whose template only
+knows `low`/`high` and leaks its thinking into `content` when switched off).
+In list mode a model can also replace efforts its engine refuses
+(`reasoning_effort_map`, e.g. `{"high": "xhigh"}`; `reasoning::EffortMap`,
+applied after the off handling to `reasoning_effort` and `reasoning.effort` on
+chat completions). The map never touches "off": `EffortMap::new` refuses off
+values and the model's off effort as keys, other off values as targets, and
+chains. A list model whose template takes a `system` message only first sets
+`merge_system_messages` (`system_messages.rs`, see the patterns above).
+
+A gateway can serve several models from one process: `VLLM_PROXY_MODEL_LIST_FILE`
+names a JSON file of models (`model_list.rs`, schema and example in
+docs/gateway-mode.md). Chat/completions then pick the model from the body's
+`model` (exact match, 404 `model_not_found` otherwise, after auth) through
+`model_list::model_for`, which returns a `ModelView`: read everything
+model-specific from it (`backend_client`, `backend_pool`, `backend_affinity`,
+`admission`, tier, discount, reasoning-off effort, effort map,
+`merge_system_messages`), never from `AppState` or `Config` directly, so the
+single-model and the list path stay one code path.
+Each model has its own pool, affinity, admission, engine poller and backend
+client (its bearer goes to its backends only). Per-model metric series go
+through the `model_counter!`/`model_gauge!`/`model_histogram!` macros
+(`model_metrics.rs`): a `model` label in list mode, exactly the old series
+without one. Two series exist in list mode only (`ModelRequest`, same file):
+`inference_proxy_model_requests_total{endpoint,status,model}`, counted on what
+the chat/completions handlers return (`count_response`, so every exit after
+model selection), and `inference_proxy_model_stream_errors_total{endpoint,model}`
+for a stream that failed after its 200 (`count_stream_error`, in the streaming
+task). A third, `inference_proxy_model_reasoning_effort_mapped_total{effort,model}`,
+counts the requests a model's `reasoning_effort_map` changed
+(`reasoning::apply_effort_map`), and a fourth,
+`inference_proxy_model_system_messages_merged_total{model}`, the requests
+`merge_system_messages` rewrote. A new per-model setting needs a `ModelConfig`
+field, a file key, a `ModelDefaults` fallback and `Config::single_model`
+(`reasoning_effort_map` and `merge_system_messages` are the two keys without a
+variable, so without a fallback: `single_model` gives the empty map and
+`false`). `main` builds a list's whole state with `model_list::app_state` and serves `routes::build_app`, and
+`tests/model_list.rs` starts its gateways through the same two functions (one
+test runs the built binary), so list-mode wiring belongs in the library, not
+in `main.rs`. Without the variable the process serves one model from env and
+nothing may change for it.
+
+### Cloud API integration
+
+- `CLOUD_API_URL` enables two features: (1) `sk-live-`/`sk-test-` API key validation via `POST /v1/check_api_key` (concurrent requests can share one in-flight check; a later request revalidates the key, `api_key_cache.rs`), (2) fire-and-forget usage reporting via `POST /v1/internal/usage` (over HTTP, the default; with `VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs` reports go to the usage queue instead, which needs `VLLM_PROXY_USAGE_REPORT_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL` (the base URL of an IMDSv2 endpoint such as `aws_signing_helper serve`, e.g. `http://127.0.0.1:9911`; the gateway does the token, role-name, credentials flow, `src/aws_credentials.rs`) and no `CLOUD_API_URL`)
+- Usage reporting is in `proxy.rs`: `spawn_usage_report()` posts (over HTTP) to `/v1/internal/usage` with the shared `CLOUD_API_USAGE_TOKEN` as Bearer and the subject identity (org/workspace/api_key_id, from the `/v1/check_api_key` response) in the body, plus a top-level `discount_to_user` when `VLLM_PROXY_DISCOUNT_TO_USER` is set (`complete_usage_body`). The legacy `sk-`-authenticated `POST /v1/usage` endpoint was removed from cloud-api; over HTTP, if `CLOUD_API_USAGE_TOKEN` (or any identity field) is missing, reporting is **skipped with an error log** — there is no fallback. Failures are logged as warnings. The checked report is serialized once and handed to `AppState.usage_report_delivery` (`usage_report.rs`), which sends it: one attempt with a 5 s timeout by default, and with `VLLM_PROXY_USAGE_REPORT_*` a longer timeout, retries with backoff (timeout, connection, transport, 5xx, 429; never another 4xx), an overall deadline (an attempt only starts while its whole timeout fits before it), a cap on reports in flight with a bounded queue (full = the report that waited longest is dropped and counted; a longer timeout and retries require the cap) and a drain at shutdown. With none of those set, the request, the log lines and the metric series must stay exactly what they were; the delivery series and the extra log fields exist only for a process whose policy differs from the default (docs/gateway-mode.md, "Usage report delivery").
+- **MODEL_NAME must exactly match `model_name` in cloud-api's model table** — cloud-api does NOT check model aliases, so a mismatch causes silent 404s on usage reporting

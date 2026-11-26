@@ -1,0 +1,4786 @@
+use std::env;
+use tracing::warn;
+
+const DEFAULT_GEMMA4_ALLOWED_MEDIA_DOMAIN: &str = "prod-files-secure.s3.us-west-2.amazonaws.com";
+/// Default `OHTTP_MAX_INFLIGHT`: high enough not to refuse normal relay
+/// traffic, while still bounding it.
+pub const DEFAULT_OHTTP_MAX_INFLIGHT: usize = 128;
+
+fn env_or(name: &str, default: &str) -> String {
+    env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_int(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Parse an optional numeric variable, failing loudly on garbage (unlike
+/// `env_int`, which silently falls back to the default).
+fn env_parse<T>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse::<T>()
+            .map_err(|e| anyhow::anyhow!("{name}: {e}")),
+        _ => Ok(default),
+    }
+}
+
+/// Comma-separated backend/probe base URLs, trimmed of blanks and trailing
+/// slashes. Missing or empty = no URLs.
+fn url_list(name: &str) -> Vec<String> {
+    env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .collect()
+}
+
+fn parse_bool(v: &str) -> bool {
+    matches!(v.to_lowercase().as_str(), "1" | "true" | "yes")
+}
+
+/// `VLLM_PROXY_INLINE_MEDIA` (default off) and its limits.
+fn media_inline_from_env() -> anyhow::Result<crate::media_inline::MediaInlineConfig> {
+    let d = crate::media_inline::MediaInlineConfig::default();
+    let secs = |name: &str, default: std::time::Duration| -> anyhow::Result<std::time::Duration> {
+        let v: u64 = env_parse(name, default.as_secs())?;
+        if v == 0 {
+            anyhow::bail!("{name} must be > 0");
+        }
+        Ok(std::time::Duration::from_secs(v))
+    };
+    Ok(crate::media_inline::MediaInlineConfig {
+        enabled: env_bool("VLLM_PROXY_INLINE_MEDIA"),
+        timeout: secs("VLLM_PROXY_INLINE_MEDIA_TIMEOUT_SECS", d.timeout)?,
+        request_deadline: secs("VLLM_PROXY_INLINE_MEDIA_DEADLINE_SECS", d.request_deadline)?,
+        max_items: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_ITEMS", d.max_items)?,
+        max_image_bytes: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_IMAGE_BYTES", d.max_image_bytes)?,
+        max_audio_bytes: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_AUDIO_BYTES", d.max_audio_bytes)?,
+        max_total_bytes: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_TOTAL_BYTES", d.max_total_bytes)?,
+        max_image_pixels: env_parse(
+            "VLLM_PROXY_INLINE_MEDIA_MAX_IMAGE_PIXELS",
+            d.max_image_pixels,
+        )?,
+        max_redirects: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_REDIRECTS", d.max_redirects)?,
+        max_concurrency: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_CONCURRENCY", d.max_concurrency)?,
+        ..d
+    })
+}
+
+/// `VLLM_PROXY_REQUEST_GUARD` (default on) and its limits; see `request_guard.rs`.
+fn request_guard_from_env() -> anyhow::Result<crate::request_guard::RequestGuardConfig> {
+    let d = crate::request_guard::RequestGuardConfig::default();
+    let max_logit_bias_value: f64 =
+        env_parse("VLLM_PROXY_MAX_LOGIT_BIAS_VALUE", d.max_logit_bias_value)?;
+    if !max_logit_bias_value.is_finite() || max_logit_bias_value < 0.0 {
+        anyhow::bail!("VLLM_PROXY_MAX_LOGIT_BIAS_VALUE must be a finite number >= 0");
+    }
+    Ok(crate::request_guard::RequestGuardConfig {
+        enabled: env_bool_optional("VLLM_PROXY_REQUEST_GUARD").unwrap_or(d.enabled),
+        max_top_logprobs: env_parse("VLLM_PROXY_MAX_TOP_LOGPROBS", d.max_top_logprobs)?,
+        max_n: env_parse("VLLM_PROXY_MAX_N", d.max_n)?,
+        max_logit_bias_entries: env_parse(
+            "VLLM_PROXY_MAX_LOGIT_BIAS_ENTRIES",
+            d.max_logit_bias_entries,
+        )?,
+        max_logit_bias_value,
+        max_stop_sequences: env_parse("VLLM_PROXY_MAX_STOP_SEQUENCES", d.max_stop_sequences)?,
+        max_stop_chars: env_parse("VLLM_PROXY_MAX_STOP_SEQUENCE_CHARS", d.max_stop_chars)?,
+        max_stop_token_ids: env_parse("VLLM_PROXY_MAX_STOP_TOKEN_IDS", d.max_stop_token_ids)?,
+        vocab_size: env_parse("VLLM_PROXY_VOCAB_SIZE", d.vocab_size)?,
+        max_model_chars: env_parse("VLLM_PROXY_MAX_MODEL_NAME_CHARS", d.max_model_chars)?,
+        max_content_part_uuid_chars: env_parse(
+            "VLLM_PROXY_MAX_CONTENT_PART_UUID_CHARS",
+            d.max_content_part_uuid_chars,
+        )?,
+        max_image_n: env_parse("VLLM_PROXY_MAX_IMAGE_N", d.max_image_n)?,
+        max_image_side: env_parse("VLLM_PROXY_MAX_IMAGE_SIDE", d.max_image_side)?,
+        max_image_steps: env_parse("VLLM_PROXY_MAX_IMAGE_STEPS", d.max_image_steps)?,
+        regex: crate::structured_regex::RegexLimits {
+            max_nested_product: env_parse(
+                "VLLM_PROXY_MAX_REGEX_NESTED_PRODUCT",
+                d.regex.max_nested_product,
+            )?,
+            max_star_repeat: env_parse(
+                "VLLM_PROXY_MAX_REGEX_STAR_REPEAT",
+                d.regex.max_star_repeat,
+            )?,
+            max_bound: env_parse("VLLM_PROXY_MAX_REGEX_BOUND", d.regex.max_bound)?,
+            max_chars: env_parse("VLLM_PROXY_MAX_REGEX_CHARS", d.regex.max_chars)?,
+        },
+        allow_grammar: env_bool_optional("VLLM_PROXY_ALLOW_GRAMMAR").unwrap_or(d.allow_grammar),
+        reject_local_media_urls: env_bool_optional("VLLM_PROXY_REJECT_LOCAL_MEDIA_URLS")
+            .unwrap_or(d.reject_local_media_urls),
+        // Unset = the default list; set (even empty) = exactly that list.
+        stripped_fields: match env::var("VLLM_PROXY_STRIPPED_REQUEST_FIELDS") {
+            Ok(raw) => crate::request_guard::parse_field_list(&raw),
+            Err(_) => d.stripped_fields,
+        },
+    })
+}
+
+fn env_bool(name: &str) -> bool {
+    env::var(name).map(|v| parse_bool(&v)).unwrap_or(false)
+}
+
+/// `VLLM_PROXY_PRIORITY_SIZE_TIERS`: unset or blank = off, malformed = startup error.
+fn priority_size_tiers_from_env() -> anyhow::Result<Option<crate::priority::SizeTiers>> {
+    const NAME: &str = "VLLM_PROXY_PRIORITY_SIZE_TIERS";
+    match env::var(NAME) {
+        Ok(raw) if !raw.trim().is_empty() => crate::priority::SizeTiers::parse(&raw)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{NAME}: {e}")),
+        _ => Ok(None),
+    }
+}
+
+fn env_bool_optional(name: &str) -> Option<bool> {
+    env::var(name).ok().map(|v| parse_bool(&v))
+}
+
+/// Whether `VLLM_BACKEND_TIER_STRICT` has an actual long-context tier to
+/// isolate: hosts configured *and* the threshold armed. Config validation
+/// keeps these two in lock step (`VLLM_BACKEND_LONG_CONTEXT_URLS` and
+/// `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` each require the other, checked
+/// just above where this is called), but `context_tier::decide`'s own
+/// off-switch is `above_tokens == 0` — checked directly here too, rather than
+/// leaning on that separate invariant, so strict mode's warning stays
+/// correct even if the two ever come apart.
+fn tier_strict_has_something_to_isolate(long_context_urls: &[String], above_tokens: u64) -> bool {
+    !long_context_urls.is_empty() && above_tokens != 0
+}
+
+/// Whether `url` is under cloud-api's service-token routes
+/// (`{CLOUD_API_URL}/v1/internal/...`). Both URLs are parsed and compared by
+/// origin (scheme, host, port) and then by path, so a look-alike host is not
+/// cloud-api, and an equivalent spelling of the same origin (an explicit
+/// default port, another host casing) still is.
+pub(crate) fn is_cloud_api_internal_url(cloud_api_url: Option<&str>, url: &str) -> bool {
+    let Some(base) = cloud_api_url.and_then(|base| reqwest::Url::parse(base).ok()) else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    url.origin() == base.origin()
+        && url
+            .path()
+            .strip_prefix(base.path().trim_end_matches('/'))
+            .is_some_and(|path| path.starts_with("/v1/internal/"))
+}
+
+/// `VLLM_PROXY_DISCOUNT_TO_USER`: the lane's discount off the list price, as
+/// a fraction. Empty or zero means none. Anything else must be a finite
+/// number in `[0, 1)` with at most four decimal places (cloud-api bills in
+/// basis points), or startup fails: this value changes what customers are
+/// shown and charged, so a typo must not be guessed at.
+fn parse_discount_to_user(raw: &str) -> anyhow::Result<Option<f64>> {
+    const NAME: &str = "VLLM_PROXY_DISCOUNT_TO_USER";
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let discount: f64 = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{NAME} must be a number in [0, 1), got {raw:?}"))?;
+    validate_discount_to_user(discount, raw)
+}
+
+/// The range and precision rules of `parse_discount_to_user`, for a value that
+/// is already a number: the variable, or a model list entry's
+/// `discount_to_user` (`model_list.rs`). `raw` is how it was written, for the
+/// message.
+pub(crate) fn validate_discount_to_user(discount: f64, raw: &str) -> anyhow::Result<Option<f64>> {
+    const NAME: &str = "VLLM_PROXY_DISCOUNT_TO_USER";
+    if !discount.is_finite() || !(0.0..1.0).contains(&discount) {
+        anyhow::bail!("{NAME} must be a number in [0, 1), got {raw:?}");
+    }
+    // Exact, no tolerance: a value with at most four decimal places parses to
+    // the f64 nearest to `basis_points / 10_000`, so the round trip gives it
+    // back (0.1 passes although it has no exact binary form); 0.12345 does not.
+    let basis_points = (discount * 10_000.0).round();
+    if basis_points / 10_000.0 != discount {
+        anyhow::bail!("{NAME} must have at most four decimal places, got {raw:?}");
+    }
+    Ok((basis_points > 0.0).then_some(discount))
+}
+
+/// Fails startup when the URL in `name` is not http(s), or is plain `http` to
+/// a host that is not loopback (127.0.0.0/8, ::1, `localhost`): credentials,
+/// the metadata session token and signed usage must not cross a network in
+/// the clear. The value itself is not echoed (it may carry userinfo).
+///
+/// `allow_insecure` (the test-only `VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS`)
+/// accepts plain `http` to any host, for a compose network whose emulators
+/// have no TLS; the scheme must still be http(s).
+fn require_secure_url(name: &str, value: &str, allow_insecure: bool) -> anyhow::Result<()> {
+    let url = url::Url::parse(value.trim())
+        .map_err(|_| anyhow::anyhow!("{name} must be an http(s) URL"))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let loopback = match url.host() {
+                Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                None => false,
+            };
+            if loopback || allow_insecure {
+                Ok(())
+            } else {
+                anyhow::bail!("{name} must be https unless its host is loopback")
+            }
+        }
+        _ => anyhow::bail!("{name} must be an http(s) URL"),
+    }
+}
+
+/// `VLLM_PROXY_USAGE_REPORT_TRANSPORT` (`http`, the default, or `sqs`) and its
+/// `VLLM_PROXY_USAGE_REPORT_SQS_*` and `VLLM_PROXY_AWS_CREDENTIALS_URL`
+/// settings. `sqs` needs a queue URL; a value that cannot work fails startup.
+fn usage_report_transport() -> anyhow::Result<crate::usage_report::UsageReportTransport> {
+    use crate::usage_report::{SqsSettings, UsageReportTransport};
+
+    const TRANSPORT: &str = "VLLM_PROXY_USAGE_REPORT_TRANSPORT";
+    const SQS_URL: &str = "VLLM_PROXY_USAGE_REPORT_SQS_URL";
+    const SQS_REGION: &str = "VLLM_PROXY_USAGE_REPORT_SQS_REGION";
+    const SQS_ENDPOINT: &str = "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT";
+    const CREDENTIALS_URL: &str = "VLLM_PROXY_AWS_CREDENTIALS_URL";
+    const ALLOW_INSECURE: &str = "VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS";
+    const DEFAULT_REGION: &str = "us-east-1";
+
+    let optional = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
+    let transport = optional(TRANSPORT).unwrap_or_else(|| "http".to_string());
+    match transport.trim() {
+        "http" => Ok(UsageReportTransport::Http),
+        "sqs" => {
+            let allow_insecure = env_bool(ALLOW_INSECURE);
+            if allow_insecure {
+                tracing::warn!(
+                    "{ALLOW_INSECURE} is set: plain-http SQS and credentials endpoints on \
+                     non-loopback hosts are accepted. Test environments only; never set this \
+                     where real credentials are served"
+                );
+            }
+            let Some(queue_url) = optional(SQS_URL) else {
+                anyhow::bail!("{TRANSPORT}=sqs requires {SQS_URL}");
+            };
+            require_secure_url(SQS_URL, &queue_url, allow_insecure)?;
+            // The credentials come only from this endpoint: no endpoint, no sqs.
+            let Some(credentials_url) = optional(CREDENTIALS_URL) else {
+                anyhow::bail!("{TRANSPORT}=sqs requires {CREDENTIALS_URL}");
+            };
+            let region = optional(SQS_REGION)
+                .map_or_else(|| DEFAULT_REGION.to_string(), |r| r.trim().to_string());
+            require_secure_url(CREDENTIALS_URL, &credentials_url, allow_insecure)?;
+            if let Some(endpoint) = optional(SQS_ENDPOINT) {
+                require_secure_url(SQS_ENDPOINT, &endpoint, allow_insecure)?;
+            }
+            // A region names an endpoint host, so it is letters, digits and hyphens only.
+            let region_ok = !region.is_empty()
+                && region.len() <= 32
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            if !region_ok {
+                anyhow::bail!(
+                    "{SQS_REGION} must be an AWS region name such as eu-west-1, not `{region}`"
+                );
+            }
+            Ok(UsageReportTransport::Sqs(SqsSettings {
+                queue_url: queue_url.trim().to_string(),
+                region,
+                endpoint: optional(SQS_ENDPOINT).map(|e| e.trim().to_string()),
+                credentials_url: credentials_url.trim().to_string(),
+            }))
+        }
+        other => anyhow::bail!("{TRANSPORT} must be `http` or `sqs`, not `{other}`"),
+    }
+}
+
+/// Whether this process bills usage: over HTTP it needs cloud-api's URL and
+/// usage token; over SQS the queue carries the usage, and `usage_report_transport`
+/// has already required its settings (queue, credentials endpoint).
+fn bills_usage(
+    cloud_api_configured: bool,
+    usage_token_configured: bool,
+    transport: &crate::usage_report::UsageReportTransport,
+) -> bool {
+    matches!(transport, crate::usage_report::UsageReportTransport::Sqs(_))
+        || (cloud_api_configured && usage_token_configured)
+}
+
+/// `VLLM_PROXY_USAGE_REPORT_*`: how usage reports are delivered to the
+/// billing API (`usage_report.rs`). With none of them set delivery is what it
+/// has always been: one attempt, 5 seconds, no cap on reports in flight,
+/// nothing awaited at shutdown. A value that cannot work fails startup: these
+/// settings decide whether usage is billed, so a typo must not be guessed at.
+///
+/// The SQS transport has its own defaults: 5 attempts (the retries that
+/// credential and clock-skew errors need) and 8 reports in flight, the cap the
+/// gateway's delivery policy sets. Each stays overridable by its variable.
+fn usage_report_policy(
+    transport: &crate::usage_report::UsageReportTransport,
+) -> anyhow::Result<crate::usage_report::UsageReportPolicy> {
+    use std::time::Duration;
+
+    const TIMEOUT: &str = "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS";
+    const MAX_ATTEMPTS: &str = "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS";
+    const INITIAL_BACKOFF: &str = "VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS";
+    const DEADLINE: &str = "VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS";
+    const MAX_IN_FLIGHT: &str = "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT";
+    const MAX_QUEUED: &str = "VLLM_PROXY_USAGE_REPORT_MAX_QUEUED";
+    const SHUTDOWN_DRAIN: &str = "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS";
+    const TIMEOUT_LIMIT_SECS: u64 = 300;
+    const MAX_ATTEMPTS_LIMIT: u32 = 10;
+    /// The backoff never exceeds 30 seconds, whatever it starts from.
+    const INITIAL_BACKOFF_LIMIT_MS: u64 = 30_000;
+    const MAX_IN_FLIGHT_LIMIT: usize = 1_000;
+    /// Each waiting report holds its serialized body and its ids, a
+    /// kilobyte or two, so this bounds the queue to a few hundred megabytes.
+    const MAX_QUEUED_LIMIT: usize = 100_000;
+    const SHUTDOWN_DRAIN_LIMIT_SECS: u64 = 600;
+    const SQS_DEFAULT_MAX_ATTEMPTS: u32 = 5;
+    const SQS_DEFAULT_MAX_IN_FLIGHT: usize = 8;
+    /// The queue's reports are durable once accepted, so a short wait at
+    /// shutdown lets the ones in flight land instead of being abandoned.
+    const SQS_DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 10;
+
+    let default = crate::usage_report::UsageReportPolicy::default();
+    let default_timeout_secs = default.attempt_timeout.as_secs();
+    let timeout_secs: u64 = env_parse(TIMEOUT, default_timeout_secs)?;
+    let (default_attempts, default_in_flight, default_shutdown_drain) = match transport {
+        crate::usage_report::UsageReportTransport::Http => (
+            default.max_attempts,
+            default.max_in_flight,
+            default.shutdown_drain,
+        ),
+        crate::usage_report::UsageReportTransport::Sqs(_) => (
+            SQS_DEFAULT_MAX_ATTEMPTS,
+            SQS_DEFAULT_MAX_IN_FLIGHT,
+            Duration::from_secs(SQS_DEFAULT_SHUTDOWN_DRAIN_SECS),
+        ),
+    };
+    let max_attempts: u32 = env_parse(MAX_ATTEMPTS, default_attempts)?;
+    let initial_backoff_ms: u64 =
+        env_parse(INITIAL_BACKOFF, default.initial_backoff.as_millis() as u64)?;
+    let deadline_secs: u64 = env_parse(DEADLINE, 0)?;
+    let max_in_flight: usize = env_parse(MAX_IN_FLIGHT, default_in_flight)?;
+    let max_queued: usize = env_parse(MAX_QUEUED, default.max_queued)?;
+    let shutdown_drain_secs: u64 = env_parse(SHUTDOWN_DRAIN, default_shutdown_drain.as_secs())?;
+
+    if !(1..=TIMEOUT_LIMIT_SECS).contains(&timeout_secs) {
+        anyhow::bail!("{TIMEOUT} must be between 1 and {TIMEOUT_LIMIT_SECS}");
+    }
+    if !(1..=MAX_ATTEMPTS_LIMIT).contains(&max_attempts) {
+        anyhow::bail!("{MAX_ATTEMPTS} must be between 1 and {MAX_ATTEMPTS_LIMIT}");
+    }
+    if initial_backoff_ms > INITIAL_BACKOFF_LIMIT_MS {
+        anyhow::bail!("{INITIAL_BACKOFF} must be at most {INITIAL_BACKOFF_LIMIT_MS}");
+    }
+    if max_attempts > 1 && initial_backoff_ms == 0 {
+        anyhow::bail!("{INITIAL_BACKOFF} must be at least 1 when {MAX_ATTEMPTS} is above 1");
+    }
+    if max_in_flight > MAX_IN_FLIGHT_LIMIT {
+        anyhow::bail!("{MAX_IN_FLIGHT} must be at most {MAX_IN_FLIGHT_LIMIT}");
+    }
+    // A report may outlive the 5 seconds it has always had only under a cap,
+    // with its bounded queue. Without one, an outage of the billing API
+    // would hold every report of that longer life in memory, each with a
+    // request open, and send them all again when it comes back.
+    if max_in_flight == 0 && (timeout_secs > default_timeout_secs || max_attempts > 1) {
+        anyhow::bail!(
+            "{TIMEOUT} above {default_timeout_secs} and {MAX_ATTEMPTS} above 1 require {MAX_IN_FLIGHT}: a report only gets more time under a cap on reports in flight, with a bounded queue behind it"
+        );
+    }
+    // The difference is all the time a report has to wait for a place and to
+    // back off: an attempt only starts while its whole timeout still fits.
+    if deadline_secs > 0 && deadline_secs <= timeout_secs {
+        anyhow::bail!("{DEADLINE} must be above {TIMEOUT}, or no attempt could ever start");
+    }
+    if !(1..=MAX_QUEUED_LIMIT).contains(&max_queued) {
+        anyhow::bail!("{MAX_QUEUED} must be between 1 and {MAX_QUEUED_LIMIT}");
+    }
+    if shutdown_drain_secs > SHUTDOWN_DRAIN_LIMIT_SECS {
+        anyhow::bail!("{SHUTDOWN_DRAIN} must be at most {SHUTDOWN_DRAIN_LIMIT_SECS}");
+    }
+    Ok(crate::usage_report::UsageReportPolicy {
+        attempt_timeout: Duration::from_secs(timeout_secs),
+        max_attempts,
+        initial_backoff: Duration::from_millis(initial_backoff_ms),
+        deadline: (deadline_secs > 0).then(|| Duration::from_secs(deadline_secs)),
+        max_in_flight,
+        max_queued,
+        shutdown_drain: Duration::from_secs(shutdown_drain_secs),
+    })
+}
+
+/// One model's admission numbers, as `check_admission` reads them.
+pub(crate) struct AdmissionKnobs {
+    pub max_inflight: u32,
+    pub start_inflight: u32,
+    pub ramp_step: u32,
+    pub ramp_interval_secs: u64,
+    pub backpressure_secs: u64,
+    pub queue_saturated_at: u32,
+    pub retry_after_secs: u64,
+}
+
+/// The rules of one model's admission budget. Applied to the single-model
+/// variables and to every entry of a model list (`model_list.rs`), whose keys
+/// are named after the variables in the messages. Nothing to check while
+/// admission is off.
+pub(crate) fn check_admission(knobs: &AdmissionKnobs) -> anyhow::Result<()> {
+    if knobs.max_inflight == 0 {
+        return Ok(());
+    }
+    if knobs.start_inflight == 0 || knobs.start_inflight > knobs.max_inflight {
+        anyhow::bail!(
+            "VLLM_PROXY_ADMISSION_START_INFLIGHT must be between 1 and VLLM_PROXY_ADMISSION_MAX_INFLIGHT"
+        );
+    }
+    if knobs.start_inflight < knobs.max_inflight && knobs.ramp_step == 0 {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_RAMP_STEP must be at least 1 when the budget ramps");
+    }
+    if knobs.ramp_interval_secs == 0 {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS must be at least 1");
+    }
+    if knobs.backpressure_secs == 0 {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS must be at least 1");
+    }
+    if knobs.queue_saturated_at == 0 {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT must be at least 1");
+    }
+    if knobs.retry_after_secs == 0 {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1");
+    }
+    Ok(())
+}
+
+/// One engine-load probe per backend, or none at all. Same sharing as
+/// `check_admission`.
+pub(crate) fn check_probe_urls(
+    backend_urls: &[String],
+    backend_probe_urls: &[String],
+) -> anyhow::Result<()> {
+    if !backend_probe_urls.is_empty() && backend_probe_urls.len() != backend_urls.len() {
+        anyhow::bail!(
+            "VLLM_BACKEND_PROBE_URLS must list one probe URL per VLLM_BACKEND_URLS entry, in the same order"
+        );
+    }
+    Ok(())
+}
+
+/// One model's backends and tier settings, as `check_long_context_tier` reads
+/// them.
+pub(crate) struct TierKnobs<'a> {
+    pub backend_urls: &'a [String],
+    pub backend_probe_urls: &'a [String],
+    pub backend_long_context_urls: &'a [String],
+    pub backend_long_context_probe_urls: &'a [String],
+    pub long_context_above_tokens: u64,
+    pub admission_max_inflight: u32,
+    pub admission_start_inflight: u32,
+    pub admission_tier_borrowing: bool,
+    pub admission_long_max_inflight_per_host: u32,
+    pub admission_long_reserved_inflight: u32,
+}
+
+/// The rules of one model's long-context tier. Same sharing as
+/// `check_admission`.
+pub(crate) fn check_long_context_tier(tier: &TierKnobs<'_>) -> anyhow::Result<()> {
+    if !tier.backend_long_context_urls.is_empty() && tier.long_context_above_tokens == 0 {
+        anyhow::bail!(
+            "VLLM_BACKEND_LONG_CONTEXT_URLS requires VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS: without a threshold nothing would ever be placed there"
+        );
+    }
+    if tier.long_context_above_tokens > 0 && tier.backend_long_context_urls.is_empty() {
+        anyhow::bail!(
+            "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS requires VLLM_BACKEND_LONG_CONTEXT_URLS"
+        );
+    }
+    if tier.admission_tier_borrowing
+        && (tier.admission_max_inflight == 0
+            || tier.backend_urls.is_empty()
+            || tier.backend_long_context_urls.is_empty()
+            || tier.admission_long_max_inflight_per_host == 0)
+    {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_TIER_BORROWING requires admission, both backend tiers, and positive VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST");
+    }
+    if tier.admission_long_reserved_inflight > 0 {
+        if !tier.admission_tier_borrowing {
+            anyhow::bail!("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT requires VLLM_PROXY_ADMISSION_TIER_BORROWING");
+        }
+        // Compared with the starting budget, the lowest the budget ever
+        // is, so the base tier always keeps at least one slot.
+        if tier.admission_long_reserved_inflight >= tier.admission_start_inflight {
+            anyhow::bail!("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT must be below VLLM_PROXY_ADMISSION_START_INFLIGHT");
+        }
+    }
+    if let Some(both) = tier
+        .backend_long_context_urls
+        .iter()
+        .find(|url| tier.backend_urls.contains(url))
+    {
+        anyhow::bail!(
+            "{both} is listed in both VLLM_BACKEND_URLS and VLLM_BACKEND_LONG_CONTEXT_URLS; one pool entry serves one tier"
+        );
+    }
+    let expected_long_probes = if tier.backend_probe_urls.is_empty() {
+        0
+    } else {
+        tier.backend_long_context_urls.len()
+    };
+    if tier.backend_long_context_probe_urls.len() != expected_long_probes {
+        anyhow::bail!(
+            "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS must list one probe URL per VLLM_BACKEND_LONG_CONTEXT_URLS entry when VLLM_BACKEND_PROBE_URLS is set, and none when it is not"
+        );
+    }
+    if let Some(twice) = tier
+        .backend_long_context_probe_urls
+        .iter()
+        .find(|url| tier.backend_probe_urls.contains(url))
+    {
+        anyhow::bail!(
+            "{twice} is listed in both VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS: a host serving both tiers has two pool entries but one engine, which the share and the engine samples would count twice"
+        );
+    }
+    Ok(())
+}
+
+fn is_gemma4_model_name(model_name: &str) -> bool {
+    let name = model_name.to_ascii_lowercase();
+    ["gemma-4", "gemma4"].iter().any(|needle| {
+        name.match_indices(needle).any(|(idx, _)| {
+            name[idx + needle.len()..]
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii_alphanumeric())
+                .unwrap_or(true)
+        })
+    })
+}
+
+fn parse_allowed_media_domains(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter_map(normalize_allowed_media_domain)
+        .collect()
+}
+
+fn normalize_allowed_media_domain(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        return url.host_str().map(normalize_host);
+    }
+    Some(normalize_host(trimmed))
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Gateway list mode (`VLLM_PROXY_MODEL_LIST_FILE`, `model_list.rs`): the
+    /// models this process serves, each resolved against the per-model
+    /// variables as its defaults. `None` = one model, described by the
+    /// fields below, exactly as before the list existed. With a list those
+    /// per-model fields (`model_name`, the backend lists, the backend token
+    /// and priority, the admission budget, the tier, capacity, discount and
+    /// reasoning-off effort) are left unset: the list is the only place a
+    /// model is defined.
+    pub model_list: Option<crate::model_list::ModelListConfig>,
+    pub model_name: String,
+    /// Accepted admin tokens. Parsed from `TOKEN` (comma-separated) so multiple
+    /// tokens can be active at once during a rotation.
+    pub tokens: Vec<String>,
+    /// One caller label per entry of `tokens`, in the same order, from
+    /// `TOKEN_LABELS` (comma-separated). Empty when the variable is unset:
+    /// every token is then `unlabeled`. See [`Config::config_token_caller`].
+    pub token_labels: Vec<&'static str>,
+
+    // Backend URLs
+    pub vllm_base_url: String,
+    pub chat_completions_url: String,
+    pub completions_url: String,
+    pub tokenize_url: String,
+    pub metrics_url: String,
+    pub models_url: String,
+    pub images_url: String,
+    pub images_edits_url: String,
+    pub transcriptions_url: String,
+    pub embeddings_url: String,
+    pub rerank_url: String,
+    pub score_url: String,
+
+    // Connection pool
+    pub max_keepalive: usize,
+    /// How long to keep an idle HTTP connection in the pool before closing it.
+    /// Must be shorter than the upstream's keepalive_timeout to avoid
+    /// reusing connections the server has already closed (which surfaces as
+    /// `error sending request for url ...` transport errors). 0 disables
+    /// pooling entirely.
+    pub pool_idle_timeout_secs: u64,
+
+    // Request size limits
+    pub max_request_size: usize,
+    pub max_image_request_size: usize,
+    pub max_audio_request_size: usize,
+
+    // Pre-dispatch image validation (reject unfetchable/non-image inputs before
+    // they reach the engine — nearai/infra#159, #172). Env vars:
+    //   VLLM_PROXY_IMAGE_VALIDATION_DISABLED=1          disable (default: on)
+    //   VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS=5      per-fetch timeout
+    //   VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES=8192      head bytes read to sniff
+    //   VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY=8   global concurrent fetches
+    //   VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS=1  permit private/loopback
+    //       image hosts (tests / trusted internal deployments; default: off)
+    //   VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS=example.com,cdn.example.com
+    //       exact remote image_url host allowlist. If unset, falls back to
+    //       VLLM_ALLOWED_MEDIA_DOMAINS when present so deployments can mirror
+    //       vLLM's --allowed-media-domains policy. Gemma-4 defaults to the
+    //       current vLLM default domain because its backend already enforces it.
+    //   VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB=0|1  force broad non-RGB
+    //       rejection. By default Gemma-4 model names reject only observed
+    //       one-channel crash inputs; broader RGBA/CMYK/palette rejection is
+    //       opt-in until real-engine verification covers those classes.
+    // NOTE: the validation fetcher bypasses system proxies (no_proxy) and uses
+    // rustls/webpki-roots. Deployments whose outbound HTTP requires an egress
+    // proxy (HTTPS_PROXY) or a custom CA that the engine trusts but rustls does
+    // not should set _DISABLED=1 — otherwise remote-image requests 400 on a
+    // connect/TLS error while the engine itself fetches fine.
+    pub image_validation_enabled: bool,
+    pub image_validation_timeout_secs: u64,
+    pub image_validation_max_bytes: usize,
+    pub image_validation_max_concurrency: usize,
+    pub image_validation_allow_private_hosts: bool,
+    pub image_validation_allowed_domains: Vec<String>,
+    pub image_validation_reject_non_rgb_images: bool,
+    pub image_validation_reject_single_channel_images: bool,
+    /// Fetch remote `image_url` / `audio_url` in the proxy and forward `data:`
+    /// URLs (`VLLM_PROXY_INLINE_MEDIA*`). The SSRF host rules and the domain
+    /// allowlist are taken from image validation, see [`Config::media_inline`].
+    pub media_inline: crate::media_inline::MediaInlineConfig,
+
+    // Cache
+    pub chat_cache_expiration_secs: u64,
+    /// TTL for cached nonce-less attestation reports (seconds).
+    pub attestation_cache_ttl_secs: u64,
+    pub attestation_max_inflight: usize,
+
+    // TLS certificate binding
+    pub tls_cert_path: Option<String>,
+
+    // Modes
+    pub dev_mode: bool,
+    pub gpu_no_hw_mode: bool,
+
+    // Version
+    pub git_rev: String,
+
+    // Rate limiting
+    pub rate_limit_per_second: u64,
+    pub rate_limit_burst_size: u32,
+    /// Trust X-Forwarded-For / X-Real-IP headers for rate-limit IP extraction.
+    /// Set to false when the proxy is directly internet-facing (no trusted
+    /// reverse proxy) to prevent IP spoofing that bypasses rate limits.
+    pub rate_limit_trust_proxy_headers: bool,
+
+    // Timeouts
+    pub timeout_secs: u64,
+    /// Maximum idle time between upstream SSE chunks after the first
+    /// generation-progress event. Zero disables the watchdog. This deliberately
+    /// does not bound queueing, prefill, or metadata-only role events;
+    /// `timeout_secs` remains the total reqwest request bound.
+    pub stream_idle_timeout_secs: u64,
+    pub timeout_tokenize_secs: u64,
+
+    // Cloud API for sk- key validation
+    pub cloud_api_url: Option<String>,
+    /// Maximum attempts (initial + retries) for `POST /v1/check_api_key`.
+    /// 1 disables retry. Retries are issued only on transport errors and 5xx.
+    pub cloud_api_auth_max_attempts: usize,
+    /// Initial backoff between auth retries; doubles each attempt with full jitter.
+    pub cloud_api_auth_initial_backoff_ms: u64,
+    /// Per-attempt timeout for `POST /v1/check_api_key`.
+    pub cloud_api_auth_timeout_secs: u64,
+    /// Shared service-token presented to cloud-api on the `/v1/internal/usage`
+    /// path. Required for usage reporting: when set AND the auth response carried
+    /// `organization_id + workspace_id + api_key_id`, the reporter posts to
+    /// `/v1/internal/usage` with this token as `Bearer` and the subject identity
+    /// in the body. When unset (or the auth response is missing identity fields),
+    /// usage reporting is skipped — cloud-api removed the legacy `Bearer sk-…`
+    /// `/v1/usage` endpoint, so there is no fallback.
+    pub cloud_api_usage_token: Option<String>,
+    /// How usage reports are delivered to cloud-api
+    /// (`VLLM_PROXY_USAGE_REPORT_*`, see `usage_report.rs`): per-attempt
+    /// timeout, retries, an overall deadline, a cap on reports in flight with
+    /// a bounded queue behind it, and a drain at shutdown. The default is one
+    /// attempt with a 5 second timeout and none of the rest.
+    pub usage_report: crate::usage_report::UsageReportPolicy,
+    /// Where usage reports are sent (`VLLM_PROXY_USAGE_REPORT_TRANSPORT`):
+    /// cloud-api over HTTP (the default) or the usage queue over SQS.
+    pub usage_report_transport: crate::usage_report::UsageReportTransport,
+
+    // Compose-manager attestation (deployment actions attestation)
+    pub compose_manager_url: Option<String>,
+
+    // GPU evidence delegation (host-level NVML serialization)
+    /// HTTP base URL of another inference-proxy on the same host that
+    /// owns NVML evidence collection (e.g. `http://vllm-proxy-leader:8000`).
+    /// When set, this proxy forwards GPU evidence requests to the
+    /// delegate's `POST /internal/gpu_evidence` endpoint instead of
+    /// calling NVML locally. The intent is to serialize NVML access
+    /// across the *host*, not just within one process — multiple
+    /// inference-proxy instances sharing the same physical GPUs were
+    /// observed to race at the firmware level (see #107). When unset,
+    /// the proxy collects evidence locally via the SDK or Python path.
+    pub gpu_evidence_delegate_url: Option<String>,
+    /// Per-attempt timeout for the delegate HTTP call. Default 30s —
+    /// the delegate's own evidence collection plus its NVML wait
+    /// dominates this; we want enough headroom to not surface as
+    /// timeouts under contended load.
+    pub gpu_evidence_delegate_timeout_secs: u64,
+
+    // OpenAI Chat Compatibility Checks
+    // Validates that hosted models (qwen, glm, etc.) send OpenAI-compliant responses:
+    // - /v1/models API format
+    // - /v1/chat/completions with tool_calls (streaming & non-streaming)
+    // Only enable for models serving OpenAI-compatible chat API. Disable for:
+    // - Image generation models (FLUX, etc.)
+    // - Embedding models
+    // - Reranker models
+    // - Cohere or other non-OpenAI-compliant APIs
+    pub openai_chat_compatibility_check_enabled: bool,
+    pub startup_check_retries: usize,
+    pub startup_check_retry_delay_secs: u64,
+    pub startup_check_timeout_secs: u64,
+
+    // Multi-backend support
+    /// All backend base URLs (derived from VLLM_BACKEND_URLS or VLLM_BASE_URL).
+    pub backend_urls: Vec<String>,
+    /// Number of independent vLLM data-parallel engines behind this proxy.
+    /// When set, append-only chat conversations are pinned to one rank so
+    /// their turns reuse that engine's local prefix cache.
+    pub vllm_data_parallel_size: Option<usize>,
+    /// Pin append-only chat conversations to one backend of `backend_urls`
+    /// so their turns reuse that engine's prefix cache instead of being
+    /// re-prefilled on whichever backend has the fewest connections. Bounded
+    /// by `backend_affinity_max_imbalance`; no effect with a single backend.
+    pub backend_conversation_affinity: bool,
+    /// Max extra in-flight requests the pinned backend may carry over the
+    /// least-loaded healthy backend before a turn is rebalanced (and the
+    /// conversation re-pinned) to the least-loaded backend.
+    pub backend_affinity_max_imbalance: u32,
+    /// Health check interval in seconds (only used when multiple backends).
+    pub health_check_interval_secs: u64,
+    /// Consecutive failures before marking a backend unhealthy.
+    pub health_check_max_failures: u32,
+    /// Health check timeout in seconds.
+    pub health_check_timeout_secs: u64,
+
+    // OHTTP Gateway (RFC 9458)
+    pub ohttp_enabled: bool,
+    /// Process-wide cap on `POST /ohttp` requests in flight
+    /// (`OHTTP_MAX_INFLIGHT`, default 128; 0 = no cap). A slot is taken
+    /// before reading the outer body and held until the relayed response is sent;
+    /// past the cap the relay answers 429 with `Retry-After`. See
+    /// `routes::ohttp::OhttpRelayLimit`.
+    pub ohttp_max_inflight: usize,
+    pub ohttp_buffer_budget: usize,
+    pub ohttp_max_response_size: usize,
+    /// Listen port for the proxy (used by OHTTP handler for loopback requests).
+    pub listen_port: u16,
+    /// Interface to bind (`LISTEN_ADDR`, default `0.0.0.0`). Gateway
+    /// deployments behind a local TLS terminator bind `127.0.0.1`.
+    pub listen_addr: String,
+    /// Bearer token attached to every request sent to the inference backends
+    /// (`VLLM_BACKEND_TOKEN`). Used when the backends are themselves
+    /// inference-proxies (gateway mode): they accept it as a trusted config
+    /// token, so they neither re-validate the customer key nor double-report
+    /// usage. Never sent to cloud-api or any other service.
+    pub backend_token: Option<String>,
+    /// Engine priority for this proxy's requests, sent as `X-NearAI-Priority`
+    /// on every backend request (`VLLM_BACKEND_PRIORITY`, gateway mode). The
+    /// CVM proxy honors it because the gateway authenticates with the trusted
+    /// token; everything else gets 0. See `priority.rs`.
+    pub backend_priority: Option<i64>,
+    /// Path probed on each backend by the pool health checker and by
+    /// `/healthz` (`VLLM_BACKEND_HEALTH_PATH`, default `/health`, the engine's
+    /// lightweight route). Gateway mode points it at the inference-proxy's
+    /// unauthenticated `/healthz`.
+    pub backend_health_path: String,
+    /// This proxy does not run inside a TEE (`NON_TEE_DEPLOYMENT=1`): no
+    /// dstack guest agent, no hardware evidence, dev signing keys. Effects:
+    /// `/healthz` skips the dstack probe, the attestation cache refresh is not
+    /// started, and `/v1/attestation/report`, `/v1/signature/{id}` and
+    /// `/internal/gpu_evidence` answer 404 so nothing unverifiable is
+    /// advertised. Inference routes are unaffected.
+    pub non_tee_deployment: bool,
+    /// Rewrite the engine's queue-full rejection (HTTP 503 / SSE error event
+    /// `"The request queue is full."`) to 429 (`VLLM_PROXY_MAP_QUEUE_FULL_TO_429`).
+    /// Aggregators treat 429 as back-pressure and 5xx as an outage; off by
+    /// default because cloud-api's peer fallback keys on the 503.
+    pub map_queue_full_to_429: bool,
+    /// The engine behind this proxy runs the *lowest* `priority` first
+    /// (`VLLM_PROXY_PRIORITY_LOWER_FIRST`): vLLM's `--scheduling-policy
+    /// priority`. The proxy then writes the negated value, so callers keep
+    /// one meaning (higher = more important) on SGLang and vLLM alike. Off by
+    /// default: SGLang runs the highest first.
+    pub priority_lower_first: bool,
+    /// Size-based priority bonus (`VLLM_PROXY_PRIORITY_SIZE_TIERS`, e.g.
+    /// `16000:10,65536:5,*:0`), CVM proxy mode only. `None` (unset or empty)
+    /// leaves `priority` exactly as the caller class set it; see `priority.rs`.
+    pub priority_size_tiers: Option<crate::priority::SizeTiers>,
+    /// For streaming requests, wait up to this many milliseconds for the
+    /// first upstream SSE chunk before committing a 200 to the client
+    /// (`VLLM_PROXY_STREAM_ERROR_PEEK_MS`, 0 = off). An engine that rejects
+    /// at admission (queue full, aborted) emits `data: {"error": …}` as its
+    /// first event on an HTTP 200 stream; peeking turns that into a real
+    /// error status instead of a 200 that fails mid-stream.
+    pub stream_error_peek_ms: u64,
+    /// Commit `200 text/event-stream` to the client after this many
+    /// milliseconds even when the upstream has not answered yet, so the
+    /// keep-alive comments can start during a long prefill (an engine sends
+    /// its response headers only with its first event). Zero disables it and
+    /// the status always comes from the upstream. A failure that arrives after
+    /// the commit is delivered as a terminal SSE `error` event instead of a
+    /// status code, so set this above the slowest error a deployment produces.
+    pub stream_commit_ms: u64,
+    /// Refuse a streaming request with 429 + `Retry-After` when the upstream
+    /// has not answered this many milliseconds after the request arrived
+    /// (`VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS`, 0 = off, the default). An
+    /// aggregator in front of the gateway cancels a silent provider on its own
+    /// deadline and books the cancel as our timeout; a 429 just under that
+    /// deadline is back-pressure instead, and it fails over just as fast.
+    pub first_token_deadline_ms: u64,
+    /// Added to the deadline per 1,000 estimated prompt tokens
+    /// (`VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS`, default 0): the
+    /// aggregator's deadline grows with the prompt, so ours has to as well.
+    pub first_token_deadline_per_1k_tokens_ms: u64,
+    /// Requests whose computed deadline is above this are not subject to one
+    /// and keep the commit window and keep-alives
+    /// (`VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS`, 0 = no cap).
+    pub first_token_deadline_max_ms: u64,
+    /// Chat content part `type`s refused with 400 before dispatch
+    /// (`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, e.g. `video_url,input_audio,file`).
+    pub rejected_content_part_types: Vec<String>,
+    /// Gateway mode: serve `/v1/models` from this URL (cloud-api's
+    /// `/v1/models`) reduced to `MODEL_NAME` and completed with the lane's
+    /// declared capacity, instead of passing the engine's list through
+    /// (`VLLM_PROXY_MODELS_DOCUMENT_URL`). Unset = engine passthrough.
+    pub models_document_url: Option<String>,
+    /// Requests per minute declared in the models document's `capacity`
+    /// (`VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE`, 0 = not declared). The
+    /// concurrency entry comes from `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`.
+    pub capacity_requests_per_minute: u64,
+    /// Gateway mode: the lane's discount off the list price, a fraction in
+    /// `[0, 1)` with at most four decimal places
+    /// (`VLLM_PROXY_DISCOUNT_TO_USER`; unset, empty or `0` = `None`, list
+    /// price). One setting drives both surfaces so the advertised and the
+    /// billed price cannot drift: it is published as `discount_to_user` on the
+    /// models document entry and sent as `discount_to_user` on every usage
+    /// report, where cloud-api applies it after catalog pricing. Requires
+    /// `VLLM_PROXY_MODELS_DOCUMENT_URL`.
+    pub discount_to_user: Option<f64>,
+    /// Single-model mode: the engine-side LoRA adapter this process's
+    /// `MODEL_NAME` is served by (`VLLM_PROXY_BACKEND_LORA`; unset or empty =
+    /// none). SGLang picks an adapter from a `lora_path` field, not from the
+    /// `model` id, so the proxy sets it on the chat, completions and
+    /// embeddings bodies it forwards (`model_list::apply_backend_lora`).
+    /// Clients may never send one themselves (`guard_request_body`).
+    pub backend_lora: Option<String>,
+    /// Single-model mode: a body `model` must be `MODEL_NAME` byte for byte
+    /// (404 `model_not_found`; 400 for a non-string), instead of being served
+    /// whatever it says (`VLLM_PROXY_STRICT_REQUEST_MODEL`, default off).
+    /// Required by `VLLM_PROXY_BACKEND_LORA`: SGLang resolves `base:adapter`
+    /// in `model` to an adapter. LoRA selector keys are refused either way.
+    pub strict_request_model: bool,
+    /// Request field guard (`request_guard.rs`): bounds on sampling fields,
+    /// `model` and content parts, and engine-internal fields stripped. On by
+    /// default (`VLLM_PROXY_REQUEST_GUARD=0` turns it off).
+    pub request_guard: crate::request_guard::RequestGuardConfig,
+    /// Gateway mode: the `reasoning_effort` that stands for "as little
+    /// reasoning as possible" on the served model
+    /// (`VLLM_PROXY_REASONING_OFF_EFFORT`, default `none`). Applied to an
+    /// aggregator's `reasoning.enabled: false`, to an effort of `none` or
+    /// `minimal`, and to those values sent as `reasoning_effort` directly.
+    /// GLM-5.3 Flash needs `low`: its template only knows `low` and `high`,
+    /// and switched off outright it writes its reasoning as visible content.
+    pub reasoning_off_effort: String,
+    /// Organizations whose cloud-api keys may use this deployment
+    /// (`VLLM_PROXY_ALLOWED_ORG_IDS`, comma-separated organization ids). Empty
+    /// = every valid key. Config-token callers are not affected. Gateway mode
+    /// uses it to keep a partner lane to that partner.
+    pub allowed_org_ids: Vec<String>,
+    /// Emit an SSE comment (`: keep-alive`) on client streams whenever the
+    /// upstream has been silent for this many seconds
+    /// (`VLLM_PROXY_SSE_KEEPALIVE_SECS`, 0 = off). Comments are not hashed into
+    /// the response signature, so leave this off where clients verify
+    /// signatures over the raw stream bytes.
+    pub sse_keepalive_secs: u64,
+    /// Lane admission (gateway mode, see `admission.rs`): hard ceiling on
+    /// chat/completions requests in flight across the fleet
+    /// (`VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, 0 = off, the default).
+    pub admission_max_inflight: u32,
+    /// Opt-in base-tier borrowing with fixed topology denominators.
+    pub admission_tier_borrowing: bool,
+    /// Long-host ceiling while borrowing (positive when enabled).
+    pub admission_long_max_inflight_per_host: u32,
+    /// Budget slots kept for requests bound for the long tier
+    /// (`VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT`, default 0: none).
+    pub admission_long_reserved_inflight: u32,
+    /// Budget at start-up (`VLLM_PROXY_ADMISSION_START_INFLIGHT`, default =
+    /// the maximum, i.e. no ramp).
+    pub admission_start_inflight: u32,
+    /// Budget increase per clean ramp interval
+    /// (`VLLM_PROXY_ADMISSION_RAMP_STEP`, default 8).
+    pub admission_ramp_step: u32,
+    /// Ramp interval (`VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS`, default 1800).
+    pub admission_ramp_interval_secs: u64,
+    /// Refuse new work while the lane's time-to-first-chunk p95 over the last
+    /// minute is above this (`VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS`, default
+    /// 30000, 0 = no TTFT check).
+    pub admission_ttft_p95_max_ms: u64,
+    /// How long an engine admission rejection counts against its backend
+    /// (`VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS`, default 10).
+    pub admission_backpressure_secs: u64,
+    /// Engine-reported queue depth at or above which a backend counts as
+    /// saturated for placement and admission
+    /// (`VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT`, default 1: a queue of at
+    /// least one request).
+    pub admission_queue_saturated_at: u32,
+    /// `Retry-After` on refusals (`VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`,
+    /// default 2).
+    pub admission_retry_after_secs: u64,
+    /// Retry a chat/completions request once on another healthy backend when
+    /// the connection to the chosen one fails before anything was sent
+    /// (`VLLM_BACKEND_CONNECT_FAILOVER`). HTTP errors, queue-full included,
+    /// are never retried.
+    pub backend_connect_failover: bool,
+    /// Keep a conversation pinned to a healthy backend that is at its limit
+    /// and refuse the request (429) instead of moving the pin
+    /// (`VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT`, default off). In list mode the
+    /// default of each model's `affinity_hold_at_limit`.
+    pub affinity_hold_at_limit: bool,
+    /// Pool proxy: at most this many requests in flight per backend
+    /// (`VLLM_BACKEND_MAX_INFLIGHT`, 0 = unbounded). A request that finds every
+    /// healthy backend at the bound is refused with 429 `overloaded` instead of
+    /// being sent: the engine's running batch, not the caller, absorbs the
+    /// limit, so a busier lane cannot slow every stream. Size it at the
+    /// concurrency where the engine's per-token latency is still acceptable,
+    /// and keep the engine's own `--max-num-seqs` at or above it. Refused with
+    /// lane admission (single-model budget or list mode), whose per-host
+    /// shares bound the same thing and would take precedence.
+    pub backend_max_inflight: Option<u32>,
+    /// Gateway mode: one plain-HTTP probe base URL per backend (same order as
+    /// `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's
+    /// running and queued request counts (`VLLM_BACKEND_PROBE_URLS`). Empty =
+    /// no engine view; placement and admission use the gateway's own counts.
+    /// Replica state publishing (`REPLICA_STATE_*`), `None` when off or
+    /// invalid (an invalid value is logged and disables only this feature).
+    pub replica_state: Option<crate::replica_state::config::ReplicaStateConfig>,
+    pub backend_probe_urls: Vec<String>,
+    /// Poll interval for the probes (`VLLM_BACKEND_PROBE_INTERVAL_SECS`,
+    /// default 2).
+    pub backend_probe_interval_secs: u64,
+    /// Gateway mode: backend URLs of the long-context tier
+    /// (`VLLM_BACKEND_LONG_CONTEXT_URLS`, the same hosts' handle URLs under
+    /// the model's `-long` model-proxy domain). Appended to the pool after
+    /// `backend_urls`, so the base backends keep their indexes.
+    pub backend_long_context_urls: Vec<String>,
+    /// One engine-load probe URL per long-context backend, same order
+    /// (`VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS`). Required with
+    /// `VLLM_BACKEND_PROBE_URLS`, empty without it.
+    pub backend_long_context_probe_urls: Vec<String>,
+    /// Estimated input tokens above which a request is placed on the
+    /// long-context tier (`VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`, 0 = off,
+    /// the default). See `context_tier.rs` for the estimate.
+    pub long_context_above_tokens: u64,
+    /// Isolate the context tiers in both directions: a request whose tier
+    /// has no healthy backend is refused instead of placed on the other tier
+    /// (`VLLM_BACKEND_TIER_STRICT`, bool, default `false`). Only meaningful
+    /// with `backend_long_context_urls` set; without one it is ignored (a
+    /// startup warning says so). See `context_tier.rs`.
+    pub backend_tier_strict: bool,
+
+    // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
+    pub images_url_override: Option<String>,
+    pub images_edits_url_override: Option<String>,
+    pub transcriptions_url_override: Option<String>,
+    pub rerank_url_override: Option<String>,
+    pub score_url_override: Option<String>,
+
+    /// `/v1/rerank` in-flight limits (`rerank_limit.rs`):
+    /// `VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE` (default 2),
+    /// `_DIRECT` (16, all Cloud API keys together) and `_TRUSTED` (16, all
+    /// config tokens together). Each must be at least 1.
+    pub rerank_limits: crate::rerank_limit::RerankLimits,
+
+    /// Path to the dstack guest agent unix socket. Probed by `/healthz` so
+    /// upstream load balancers can detach this instance when the socket is
+    /// unreachable (otherwise `/v1/attestation/report` silently 500s while
+    /// `/v1/models` still passes). Default: `/var/run/dstack.sock`.
+    pub dstack_socket_path: String,
+
+    // Agent loop (server-side web_context_search tool)
+    /// Brave LLM Context API endpoint. When unset, requests advertising the
+    /// `{"type":"web_context_search"}` tool are rejected with 400. All
+    /// tool execution happens inside the CVM; the query is the only thing
+    /// that egresses, going directly to Brave under TLS.
+    pub web_context_search_url: Option<String>,
+    /// Brave subscription token for the LLM Context endpoint. Sent as
+    /// `X-Subscription-Token`. Required when `web_context_search_url` is set.
+    pub web_context_search_api_key: Option<String>,
+    /// Hard cap on tool-call iterations within a single chat completion.
+    /// Once hit, the loop emits a synthetic terminator chunk and stops.
+    pub agent_loop_max_iterations: u32,
+    /// Per-tool-call timeout for the Brave HTTP request.
+    pub web_context_search_timeout_secs: u64,
+}
+
+impl Config {
+    /// Moves a process whose usage queue failed its startup check to the HTTP
+    /// transport, with the policy HTTP would have had: the defaults of the
+    /// HTTP transport for every `VLLM_PROXY_USAGE_REPORT_*` variable that is
+    /// unset (not the SQS defaults), and explicit values unchanged.
+    pub fn fall_back_to_http_usage_transport(&mut self) -> anyhow::Result<()> {
+        self.usage_report_transport = crate::usage_report::UsageReportTransport::Http;
+        self.usage_report = usage_report_policy(&self.usage_report_transport)?;
+        Ok(())
+    }
+
+    /// Takes the transport the startup check settled on (`resolve_transport`).
+    /// When it is not the configured one the process fell back to HTTP, and is
+    /// moved there as `fall_back_to_http_usage_transport` says. Returns whether
+    /// it fell back.
+    pub fn adopt_usage_transport(
+        &mut self,
+        resolved: crate::usage_report::UsageReportTransport,
+    ) -> anyhow::Result<bool> {
+        let fell_back = resolved != self.usage_report_transport;
+        if fell_back {
+            self.fall_back_to_http_usage_transport()?;
+        }
+        Ok(fell_back)
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        // Gateway list mode: ids and backends come from the file, so the
+        // variables that name the one model of a single-model process have
+        // nothing to say next to it, and are refused rather than ignored.
+        let model_list_file = env::var(crate::model_list::MODEL_LIST_FILE_ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let list_mode = model_list_file.is_some();
+        if list_mode {
+            for name in crate::model_list::SINGLE_MODEL_ENV {
+                if env::var(name).is_ok_and(|v| !v.trim().is_empty()) {
+                    anyhow::bail!(
+                        "{name} cannot be set together with {}: the file names every model and its backends",
+                        crate::model_list::MODEL_LIST_FILE_ENV
+                    );
+                }
+            }
+        }
+        let model_name = if list_mode {
+            String::new()
+        } else {
+            env::var("MODEL_NAME")
+                .map_err(|_| anyhow::anyhow!("MODEL_NAME environment variable is required"))?
+        };
+        let raw_tokens = env::var("TOKEN")
+            .map_err(|_| anyhow::anyhow!("TOKEN environment variable is required"))?;
+        let tokens: Vec<String> = raw_tokens
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            anyhow::bail!("TOKEN must contain at least one non-empty token");
+        }
+        let token_labels = parse_token_labels(env::var("TOKEN_LABELS").ok().as_deref(), &tokens)?;
+
+        // List mode has no engine of its own next to it: the single-model
+        // backend is a name that cannot resolve (`UNROUTED_BACKEND_URL`).
+        let vllm_base_url = if list_mode {
+            crate::model_list::UNROUTED_BACKEND_URL.to_string()
+        } else {
+            env_or("VLLM_BASE_URL", "http://localhost:8000")
+        };
+        let base = vllm_base_url.trim_end_matches('/');
+
+        // Multi-backend: VLLM_BACKEND_URLS takes precedence over VLLM_BASE_URL
+        let backend_urls: Vec<String> = env::var("VLLM_BACKEND_URLS")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.split(',')
+                    .map(|u| u.trim().trim_end_matches('/').to_string())
+                    .filter(|u| !u.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![vllm_base_url.clone()]);
+        if backend_urls.is_empty() {
+            anyhow::bail!("VLLM_BACKEND_URLS is set but contains no valid URLs");
+        }
+
+        let vllm_data_parallel_size = match env::var("VLLM_DATA_PARALLEL_SIZE") {
+            Ok(raw) => {
+                let value = raw.trim().parse::<usize>().map_err(|_| {
+                    anyhow::anyhow!("VLLM_DATA_PARALLEL_SIZE must be a positive integer")
+                })?;
+                if value == 0 {
+                    anyhow::bail!("VLLM_DATA_PARALLEL_SIZE must be a positive integer");
+                }
+                Some(value)
+            }
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("VLLM_DATA_PARALLEL_SIZE must be valid UTF-8")
+            }
+        };
+        if vllm_data_parallel_size.is_some() && backend_urls.len() != 1 {
+            anyhow::bail!(
+                "VLLM_DATA_PARALLEL_SIZE requires exactly one vLLM backend; multiple VLLM_BACKEND_URLS have independent prefix caches"
+            );
+        }
+
+        let backend_conversation_affinity = env_bool("VLLM_BACKEND_CONVERSATION_AFFINITY");
+        if backend_conversation_affinity && vllm_data_parallel_size.is_some() {
+            anyhow::bail!(
+                "VLLM_BACKEND_CONVERSATION_AFFINITY and VLLM_DATA_PARALLEL_SIZE are mutually exclusive; data-parallel affinity already pins conversations inside the single backend"
+            );
+        }
+        let backend_affinity_max_imbalance =
+            u32::try_from(env_int("VLLM_BACKEND_AFFINITY_MAX_IMBALANCE", 8)).map_err(|_| {
+                anyhow::anyhow!("VLLM_BACKEND_AFFINITY_MAX_IMBALANCE exceeds the u32 range")
+            })?;
+
+        // Track which endpoint URLs are explicitly overridden (should bypass pool)
+        let images_url_override = env::var("VLLM_IMAGES_URL").ok().filter(|s| !s.is_empty());
+        let images_edits_url_override = env::var("VLLM_IMAGES_EDITS_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let transcriptions_url_override = env::var("VLLM_TRANSCRIPTIONS_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let rerank_url_override = env::var("VLLM_RERANK_URL").ok().filter(|s| !s.is_empty());
+        let score_url_override = env::var("VLLM_SCORE_URL").ok().filter(|s| !s.is_empty());
+
+        let images_url = images_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{base}/v1/images/generations"));
+        let images_edits_url = images_edits_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{base}/v1/images/edits"));
+        let transcriptions_url = transcriptions_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{base}/v1/audio/transcriptions"));
+        let rerank_url = rerank_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{base}/v1/rerank"));
+        let score_url = score_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{base}/v1/score"));
+
+        let listen_port: u16 = env::var("LISTEN_PORT")
+            .unwrap_or_else(|_| "8000".to_string())
+            .parse()
+            .map_err(|_| anyhow::anyhow!("LISTEN_PORT must be a valid port number"))?;
+        let listen_addr = env_or("LISTEN_ADDR", "0.0.0.0");
+        let listen_ip: std::net::IpAddr = listen_addr
+            .parse()
+            .map_err(|_| anyhow::anyhow!("LISTEN_ADDR must be an IP address"))?;
+        // The OHTTP gateway re-dispatches decoded requests to 127.0.0.1 on
+        // the listen port, so it needs a bind that loopback can reach.
+        if env_bool("OHTTP_ENABLED") && !(listen_ip.is_unspecified() || listen_ip.is_loopback()) {
+            anyhow::bail!(
+                "OHTTP_ENABLED requires LISTEN_ADDR to be unspecified (0.0.0.0/::) or loopback"
+            );
+        }
+        let transport = usage_report_transport()?;
+        let backend_token = env::var("VLLM_BACKEND_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // A backend bearer means the backends treat this proxy as trusted and
+        // do not bill its requests, so this proxy must be able to: fail closed
+        // at startup instead of serving unbilled inference.
+        if backend_token.is_some() {
+            let set = |name: &str| env::var(name).is_ok_and(|v| !v.trim().is_empty());
+            if !bills_usage(
+                set("CLOUD_API_URL"),
+                set("CLOUD_API_USAGE_TOKEN"),
+                &transport,
+            ) {
+                anyhow::bail!(
+                    "VLLM_BACKEND_TOKEN requires billing: CLOUD_API_URL and CLOUD_API_USAGE_TOKEN, or VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs: backends do not bill trusted-token requests"
+                );
+            }
+        }
+        let backend_priority = match env::var("VLLM_BACKEND_PRIORITY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(raw) => Some(
+                crate::priority::validate_priority(&raw)
+                    .map_err(|e| anyhow::anyhow!("VLLM_BACKEND_PRIORITY: {e}"))?,
+            ),
+            None => None,
+        };
+        let backend_health_path = env_or("VLLM_BACKEND_HEALTH_PATH", "/health");
+        if !backend_health_path.starts_with('/') {
+            anyhow::bail!("VLLM_BACKEND_HEALTH_PATH must start with '/'");
+        }
+        let allowed_org_ids: Vec<String> = env::var("VLLM_PROXY_ALLOWED_ORG_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let models_document_url = env::var("VLLM_PROXY_MODELS_DOCUMENT_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let capacity_requests_per_minute: u64 =
+            env_parse("VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE", 0)?;
+        let discount_to_user = match env::var("VLLM_PROXY_DISCOUNT_TO_USER") {
+            Ok(raw) => parse_discount_to_user(&raw)?,
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("VLLM_PROXY_DISCOUNT_TO_USER must be valid UTF-8")
+            }
+        };
+        let backend_lora = env::var("VLLM_PROXY_BACKEND_LORA")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let strict_request_model = env_bool("VLLM_PROXY_STRICT_REQUEST_MODEL");
+        if backend_lora.is_some() && !strict_request_model {
+            anyhow::bail!(
+                "VLLM_PROXY_BACKEND_LORA requires VLLM_PROXY_STRICT_REQUEST_MODEL=1: without it a request `model` of `base:adapter` would select any adapter on the engine"
+            );
+        }
+        // Every usage report is billed at the discount, so the listing has to
+        // publish it, and only the models document can: without it `/v1/models`
+        // would pass the engine's list through at list price.
+        if discount_to_user.is_some() && models_document_url.is_none() {
+            anyhow::bail!(
+                "VLLM_PROXY_DISCOUNT_TO_USER requires VLLM_PROXY_MODELS_DOCUMENT_URL: usage is billed at the discount, so the models document must publish it"
+            );
+        }
+        let reasoning_off_effort = env_or("VLLM_PROXY_REASONING_OFF_EFFORT", "none")
+            .trim()
+            .to_string();
+        let rejected_content_part_types = crate::content_policy::parse_rejected_types(
+            &env::var("VLLM_PROXY_REJECTED_CONTENT_PART_TYPES").unwrap_or_default(),
+        );
+
+        let git_rev = std::fs::read_to_string("/etc/.GIT_REV")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        // Handle TLS certificate path with logging
+        let tls_cert_path = env::var("TLS_CERT_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|path| {
+                if std::path::Path::new(&path).exists() {
+                    Some(path)
+                } else {
+                    warn!(
+                        error_kind = "tls_cert_missing",
+                        "TLS_CERT_PATH is set but file does not exist"
+                    );
+                    None
+                }
+            });
+
+        let cloud_api_url = env::var("CLOUD_API_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_string());
+        // cloud-api's internal catalog answers 401 without the service token,
+        // so a lane told to read it has to hold one: fail at startup instead
+        // of serving a models document that can never be read.
+        if let Some(source) = models_document_url.as_deref() {
+            let has_usage_token =
+                env::var("CLOUD_API_USAGE_TOKEN").is_ok_and(|v| !v.trim().is_empty());
+            if is_cloud_api_internal_url(cloud_api_url.as_deref(), source) && !has_usage_token {
+                anyhow::bail!(
+                    "VLLM_PROXY_MODELS_DOCUMENT_URL points at cloud-api's internal catalog, which requires CLOUD_API_USAGE_TOKEN"
+                );
+            }
+        }
+
+        let compose_manager_url = env::var("COMPOSE_MANAGER_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_string());
+
+        let image_validation_reject_non_rgb_override =
+            env_bool_optional("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+        let image_validation_reject_single_channel_images =
+            image_validation_reject_non_rgb_override
+                .unwrap_or_else(|| is_gemma4_model_name(&model_name));
+        let image_validation_reject_non_rgb_images =
+            image_validation_reject_non_rgb_override.unwrap_or(false);
+        let image_validation_allowed_domains =
+            env::var("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS")
+                .ok()
+                .map(|s| parse_allowed_media_domains(&s))
+                .or_else(|| {
+                    env::var("VLLM_ALLOWED_MEDIA_DOMAINS")
+                        .ok()
+                        .map(|s| parse_allowed_media_domains(&s))
+                })
+                .unwrap_or_else(|| {
+                    if is_gemma4_model_name(&model_name) {
+                        vec![DEFAULT_GEMMA4_ALLOWED_MEDIA_DOMAIN.to_string()]
+                    } else {
+                        Vec::new()
+                    }
+                });
+
+        let admission_tier_borrowing = env_bool("VLLM_PROXY_ADMISSION_TIER_BORROWING");
+        let admission_long_max_inflight_per_host: u32 =
+            env_parse("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", 0)?;
+        let admission_long_reserved_inflight: u32 =
+            env_parse("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT", 0)?;
+        let admission_max_inflight: u32 = env_parse("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", 0)?;
+        let admission_start_inflight: u32 = env_parse(
+            "VLLM_PROXY_ADMISSION_START_INFLIGHT",
+            admission_max_inflight,
+        )?;
+        let admission_start_inflight_is_set =
+            env::var("VLLM_PROXY_ADMISSION_START_INFLIGHT").is_ok_and(|raw| !raw.trim().is_empty());
+        let admission_ramp_step: u32 = env_parse("VLLM_PROXY_ADMISSION_RAMP_STEP", 8)?;
+        let admission_ramp_interval_secs: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", 1800)?;
+        let admission_ttft_p95_max_ms: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", 30_000)?;
+        let admission_backpressure_secs: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", 10)?;
+        let admission_queue_saturated_at: u32 =
+            env_parse("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", 1)?;
+        let admission_retry_after_secs: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", 2)?;
+        // In list mode these are the entries' defaults, and each entry is
+        // checked with what it resolves to (`model_list::load`, below).
+        if !list_mode {
+            check_admission(&AdmissionKnobs {
+                max_inflight: admission_max_inflight,
+                start_inflight: admission_start_inflight,
+                ramp_step: admission_ramp_step,
+                ramp_interval_secs: admission_ramp_interval_secs,
+                backpressure_secs: admission_backpressure_secs,
+                queue_saturated_at: admission_queue_saturated_at,
+                retry_after_secs: admission_retry_after_secs,
+            })?;
+        }
+        let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
+        let affinity_hold_at_limit = env_bool("VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT");
+        let backend_max_inflight = match env_parse::<u32>("VLLM_BACKEND_MAX_INFLIGHT", 0)? {
+            0 => None,
+            bound => Some(bound),
+        };
+        // Lane admission bounds each backend through its host share, which
+        // would take precedence (`Policy::limit`); a gateway in list mode sets
+        // that per model. Refuse the pair rather than let one silently win.
+        if backend_max_inflight.is_some() && (admission_max_inflight > 0 || list_mode) {
+            anyhow::bail!(
+                "VLLM_BACKEND_MAX_INFLIGHT is for a pool proxy and cannot be combined with lane \
+                 admission (VLLM_PROXY_ADMISSION_MAX_INFLIGHT or {})",
+                crate::model_list::MODEL_LIST_FILE_ENV
+            );
+        }
+        let backend_probe_urls = url_list("VLLM_BACKEND_PROBE_URLS");
+        check_probe_urls(&backend_urls, &backend_probe_urls)?;
+        let backend_probe_interval_secs: u64 = env_parse("VLLM_BACKEND_PROBE_INTERVAL_SECS", 2)?;
+        if backend_probe_interval_secs == 0 {
+            anyhow::bail!("VLLM_BACKEND_PROBE_INTERVAL_SECS must be at least 1");
+        }
+
+        // Long-context tier: a second set of hosts, registered under the
+        // model's `-long` model-proxy domain, for oversized prompts.
+        let backend_long_context_urls = url_list("VLLM_BACKEND_LONG_CONTEXT_URLS");
+        let backend_long_context_probe_urls = url_list("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS");
+        let long_context_above_tokens: u64 =
+            env_parse("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", 0)?;
+        // As above: in list mode the tier variables are defaults for the
+        // entries that have a tier, and no tier of this process's own.
+        if !list_mode {
+            check_long_context_tier(&TierKnobs {
+                backend_urls: &backend_urls,
+                backend_probe_urls: &backend_probe_urls,
+                backend_long_context_urls: &backend_long_context_urls,
+                backend_long_context_probe_urls: &backend_long_context_probe_urls,
+                long_context_above_tokens,
+                admission_max_inflight,
+                admission_start_inflight,
+                admission_tier_borrowing,
+                admission_long_max_inflight_per_host,
+                admission_long_reserved_inflight,
+            })?;
+        }
+        if !backend_long_context_urls.is_empty() && vllm_data_parallel_size.is_some() {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_URLS and VLLM_DATA_PARALLEL_SIZE are mutually exclusive; data-parallel affinity serves one backend"
+            );
+        }
+        let backend_tier_strict = env_bool("VLLM_BACKEND_TIER_STRICT");
+        // What the variable says, before it is dropped for a process without
+        // a tier: a model list entry with a tier defaults to it.
+        let backend_tier_strict_requested = backend_tier_strict;
+        if backend_tier_strict
+            && !list_mode
+            && !tier_strict_has_something_to_isolate(
+                &backend_long_context_urls,
+                long_context_above_tokens,
+            )
+        {
+            warn!(
+                "VLLM_BACKEND_TIER_STRICT is set but the long-context tier is not effectively \
+                 configured (VLLM_BACKEND_LONG_CONTEXT_URLS is empty or \
+                 VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS is 0); ignoring it, there is nothing to isolate"
+            );
+        }
+        let backend_tier_strict = backend_tier_strict
+            && tier_strict_has_something_to_isolate(
+                &backend_long_context_urls,
+                long_context_above_tokens,
+            );
+
+        // First-token deadline: the slope and the cap only mean something
+        // together with the base, and a cap below the base would exempt every
+        // request.
+        let first_token_deadline_ms: u64 = env_parse("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS", 0)?;
+        let first_token_deadline_per_1k_tokens_ms: u64 =
+            env_parse("VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS", 0)?;
+        let first_token_deadline_max_ms: u64 =
+            env_parse("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS", 0)?;
+        if first_token_deadline_ms == 0
+            && (first_token_deadline_per_1k_tokens_ms > 0 || first_token_deadline_max_ms > 0)
+        {
+            anyhow::bail!(
+                "VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS and VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS require VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS"
+            );
+        }
+        if first_token_deadline_max_ms > 0 && first_token_deadline_max_ms < first_token_deadline_ms
+        {
+            anyhow::bail!(
+                "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS must be at least VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS, or no request would ever have a deadline"
+            );
+        }
+
+        let replica_state =
+            match crate::replica_state::config::ReplicaStateConfig::from_lookup(|k| {
+                env::var(k).ok()
+            }) {
+                Ok(rs) => rs,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "Replica state publishing disabled: invalid REPLICA_STATE_* configuration"
+                    );
+                    None
+                }
+            };
+        let mut config = Config {
+            model_list: None,
+            model_name,
+            tokens,
+            token_labels,
+            vllm_base_url: vllm_base_url.clone(),
+            chat_completions_url: format!("{base}/v1/chat/completions"),
+            completions_url: format!("{base}/v1/completions"),
+            tokenize_url: format!("{base}/tokenize"),
+            metrics_url: format!("{base}/metrics"),
+            models_url: format!("{base}/v1/models"),
+            images_url,
+            images_edits_url,
+            transcriptions_url,
+            embeddings_url: format!("{base}/v1/embeddings"),
+            rerank_url,
+            score_url,
+            cloud_api_url,
+            cloud_api_auth_max_attempts: env_int("CLOUD_API_AUTH_MAX_ATTEMPTS", 3),
+            cloud_api_auth_initial_backoff_ms: env_int("CLOUD_API_AUTH_INITIAL_BACKOFF_MS", 100)
+                as u64,
+            cloud_api_auth_timeout_secs: env_int("CLOUD_API_AUTH_TIMEOUT_SECS", 5) as u64,
+            cloud_api_usage_token: env::var("CLOUD_API_USAGE_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            usage_report: usage_report_policy(&transport)?,
+            usage_report_transport: transport,
+            compose_manager_url,
+            gpu_evidence_delegate_url: env::var("GPU_EVIDENCE_DELEGATE_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim_end_matches('/').to_string()),
+            gpu_evidence_delegate_timeout_secs: env_int("GPU_EVIDENCE_DELEGATE_TIMEOUT_SECS", 30)
+                as u64,
+            tls_cert_path,
+            max_keepalive: env_int("VLLM_PROXY_MAX_KEEPALIVE", 100),
+            pool_idle_timeout_secs: env_int("VLLM_PROXY_POOL_IDLE_TIMEOUT_SECS", 60) as u64,
+            max_request_size: env_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024),
+            max_image_request_size: env_int("VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE", 50 * 1024 * 1024),
+            max_audio_request_size: env_int("VLLM_PROXY_MAX_AUDIO_REQUEST_SIZE", 100 * 1024 * 1024),
+            image_validation_enabled: !env_bool("VLLM_PROXY_IMAGE_VALIDATION_DISABLED"),
+            image_validation_timeout_secs: env_int("VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS", 5)
+                as u64,
+            image_validation_max_bytes: env_int("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", 8192),
+            image_validation_max_concurrency: env_int(
+                "VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY",
+                8,
+            ),
+            image_validation_allow_private_hosts: env_bool(
+                "VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS",
+            ),
+            image_validation_allowed_domains,
+            image_validation_reject_non_rgb_images,
+            image_validation_reject_single_channel_images,
+            media_inline: media_inline_from_env()?,
+            chat_cache_expiration_secs: env_int("CHAT_CACHE_EXPIRATION", 1200) as u64,
+            attestation_cache_ttl_secs: env_int("ATTESTATION_CACHE_TTL", 300) as u64,
+            attestation_max_inflight: env_parse(
+                "ATTESTATION_MAX_INFLIGHT",
+                crate::attestation::DEFAULT_ATTESTATION_MAX_INFLIGHT,
+            )?,
+            dev_mode: env_bool("DEV"),
+            gpu_no_hw_mode: env_bool("GPU_NO_HW_MODE"),
+            git_rev,
+            rate_limit_per_second: env_int("RATE_LIMIT_PER_SECOND", 100) as u64,
+            rate_limit_burst_size: env_int("RATE_LIMIT_BURST_SIZE", 200) as u32,
+            rate_limit_trust_proxy_headers: !env_bool("RATE_LIMIT_NO_TRUST_PROXY"),
+            timeout_secs: env_int("VLLM_PROXY_TIMEOUT_SECS", 3600) as u64,
+            stream_idle_timeout_secs: env_int("VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS", 0) as u64,
+            timeout_tokenize_secs: 10,
+            openai_chat_compatibility_check_enabled: env_bool("OPENAI_CHAT_COMPATIBILITY_CHECK"),
+            startup_check_retries: env_int("STARTUP_CHECK_RETRIES", 3),
+            startup_check_retry_delay_secs: env_int("STARTUP_CHECK_RETRY_DELAY_SECS", 5) as u64,
+            startup_check_timeout_secs: env_int("STARTUP_CHECK_TIMEOUT_SECS", 30) as u64,
+            backend_urls,
+            vllm_data_parallel_size,
+            backend_conversation_affinity,
+            backend_affinity_max_imbalance,
+            health_check_interval_secs: env_int("HEALTH_CHECK_INTERVAL_SECS", 5) as u64,
+            health_check_max_failures: env_int("HEALTH_CHECK_MAX_FAILURES", 3) as u32,
+            health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
+            ohttp_enabled: env_bool("OHTTP_ENABLED"),
+            ohttp_max_inflight: env_parse("OHTTP_MAX_INFLIGHT", DEFAULT_OHTTP_MAX_INFLIGHT)?,
+            ohttp_buffer_budget: env_parse("OHTTP_BUFFER_BUDGET_BYTES", 256 * 1024 * 1024)?,
+            ohttp_max_response_size: env_parse("OHTTP_MAX_RESPONSE_BYTES", 32 * 1024 * 1024)?,
+            listen_port,
+            listen_addr,
+            backend_token,
+            backend_priority,
+            backend_health_path,
+            non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
+            map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
+            priority_lower_first: env_bool("VLLM_PROXY_PRIORITY_LOWER_FIRST"),
+            priority_size_tiers: priority_size_tiers_from_env()?,
+            stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
+            stream_commit_ms: env_int("VLLM_PROXY_STREAM_COMMIT_MS", 0) as u64,
+            first_token_deadline_ms,
+            first_token_deadline_per_1k_tokens_ms,
+            first_token_deadline_max_ms,
+            rejected_content_part_types,
+            models_document_url,
+            capacity_requests_per_minute,
+            discount_to_user,
+            backend_lora,
+            strict_request_model,
+            request_guard: request_guard_from_env()?,
+            reasoning_off_effort,
+            allowed_org_ids,
+            sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
+            admission_max_inflight,
+            admission_tier_borrowing,
+            admission_long_max_inflight_per_host,
+            admission_long_reserved_inflight,
+            admission_start_inflight,
+            admission_ramp_step,
+            admission_ramp_interval_secs,
+            admission_ttft_p95_max_ms,
+            admission_backpressure_secs,
+            admission_queue_saturated_at,
+            admission_retry_after_secs,
+            backend_connect_failover,
+            affinity_hold_at_limit,
+            backend_max_inflight,
+            replica_state,
+            backend_probe_urls,
+            backend_probe_interval_secs,
+            backend_long_context_urls,
+            backend_long_context_probe_urls,
+            long_context_above_tokens,
+            backend_tier_strict,
+            images_url_override,
+            images_edits_url_override,
+            transcriptions_url_override,
+            rerank_url_override,
+            score_url_override,
+            rerank_limits: crate::rerank_limit::RerankLimits {
+                per_workspace: env_parse(
+                    "VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE",
+                    crate::rerank_limit::DEFAULT_MAX_IN_FLIGHT_PER_WORKSPACE,
+                )?,
+                direct: env_parse(
+                    "VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT",
+                    crate::rerank_limit::DEFAULT_MAX_IN_FLIGHT_DIRECT,
+                )?,
+                trusted: env_parse(
+                    "VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED",
+                    crate::rerank_limit::DEFAULT_MAX_IN_FLIGHT_TRUSTED,
+                )?,
+            },
+            dstack_socket_path: env_or("DSTACK_SOCKET_PATH", "/var/run/dstack.sock"),
+            web_context_search_url: env::var("WEB_CONTEXT_SEARCH_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            web_context_search_api_key: env::var("WEB_CONTEXT_SEARCH_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    env::var("BRAVE_LLM_CONTEXT_API_KEY")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                }),
+            // `env_int` returns `usize`; on 64-bit hosts a user-supplied value
+            // > u32::MAX would silently wrap. `try_from` surfaces it as a
+            // config error instead so a typo can't become a tiny iteration cap.
+            agent_loop_max_iterations: u32::try_from(env_int("AGENT_LOOP_MAX_ITERATIONS", 5))
+                .map_err(|_| anyhow::anyhow!("AGENT_LOOP_MAX_ITERATIONS exceeds the u32 range"))?,
+            web_context_search_timeout_secs: env_int("WEB_CONTEXT_SEARCH_TIMEOUT_SECS", 30) as u64,
+        };
+
+        // Validate attestation cache TTL (TTL/2 is used as refresh interval, so TTL < 2 would cause a busy loop)
+        if !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&config.attestation_max_inflight) {
+            anyhow::bail!(
+                "ATTESTATION_MAX_INFLIGHT must be between 1 and {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            );
+        }
+        if config.attestation_cache_ttl_secs < 2 {
+            anyhow::bail!(
+                "ATTESTATION_CACHE_TTL must be at least 2 (got {})",
+                config.attestation_cache_ttl_secs
+            );
+        }
+
+        // A rerank limit of 0 would refuse every request of its pool.
+        for (name, value) in [
+            (
+                "VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE",
+                config.rerank_limits.per_workspace,
+            ),
+            (
+                "VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT",
+                config.rerank_limits.direct,
+            ),
+            (
+                "VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED",
+                config.rerank_limits.trusted,
+            ),
+        ] {
+            if value == 0 {
+                anyhow::bail!("{name} must be at least 1");
+            }
+        }
+
+        // Validate startup check configuration
+        if config.startup_check_retries == 0 {
+            anyhow::bail!("STARTUP_CHECK_RETRIES must be at least 1");
+        }
+        if config.startup_check_timeout_secs == 0 {
+            anyhow::bail!("STARTUP_CHECK_TIMEOUT_SECS must be greater than 0");
+        }
+
+        // Agent loop: URL and key must both be set or both unset; iteration cap must be positive.
+        if config.web_context_search_url.is_some() != config.web_context_search_api_key.is_some() {
+            anyhow::bail!(
+                "WEB_CONTEXT_SEARCH_URL and WEB_CONTEXT_SEARCH_API_KEY or BRAVE_LLM_CONTEXT_API_KEY must both be set or both unset"
+            );
+        }
+        if config.agent_loop_max_iterations == 0 {
+            anyhow::bail!("AGENT_LOOP_MAX_ITERATIONS must be at least 1");
+        }
+        if config.web_context_search_timeout_secs == 0 {
+            anyhow::bail!("WEB_CONTEXT_SEARCH_TIMEOUT_SECS must be greater than 0");
+        }
+
+        if config.admission_max_inflight > 0 && config.web_context_search_url.is_some() {
+            anyhow::bail!(
+                "VLLM_PROXY_ADMISSION_MAX_INFLIGHT cannot be combined with WEB_CONTEXT_SEARCH_URL: that execution mode runs outside the lane budget"
+            );
+        }
+        if !config.backend_long_context_urls.is_empty() && config.web_context_search_url.is_some() {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_URLS cannot be combined with WEB_CONTEXT_SEARCH_URL: that execution mode places its own backend requests, outside the tier"
+            );
+        }
+        if let Some(path) = model_list_file {
+            crate::model_list::check_process(&config)?;
+            let defaults = crate::model_list::ModelDefaults {
+                long_context_above_tokens: config.long_context_above_tokens,
+                backend_tier_strict: backend_tier_strict_requested,
+                admission_max_inflight: config.admission_max_inflight,
+                admission_start_inflight: admission_start_inflight_is_set
+                    .then_some(config.admission_start_inflight),
+                admission_queue_saturated_at: config.admission_queue_saturated_at,
+                affinity_hold_at_limit: config.affinity_hold_at_limit,
+                admission_tier_borrowing: config.admission_tier_borrowing,
+                admission_long_max_inflight_per_host: config.admission_long_max_inflight_per_host,
+                admission_long_reserved_inflight: config.admission_long_reserved_inflight,
+                capacity_requests_per_minute: config.capacity_requests_per_minute,
+                discount_to_user: config.discount_to_user,
+                reasoning_off_effort: config.reasoning_off_effort.clone(),
+                backend_token: config.backend_token.clone(),
+                backend_priority: config.backend_priority,
+            };
+            let process = crate::model_list::ProcessSettings {
+                admission_ramp_step: config.admission_ramp_step,
+                admission_ramp_interval_secs: config.admission_ramp_interval_secs,
+                admission_backpressure_secs: config.admission_backpressure_secs,
+                admission_retry_after_secs: config.admission_retry_after_secs,
+                bills_usage: bills_usage(
+                    config.cloud_api_url.is_some(),
+                    config.cloud_api_usage_token.is_some(),
+                    &config.usage_report_transport,
+                ),
+            };
+            let crate::model_list::ParsedList { models, listed } =
+                crate::model_list::load(&path, &defaults, &process, &|name| env::var(name).ok())?;
+            config.unset_single_model();
+            config.model_list = Some(crate::model_list::ModelListConfig {
+                path,
+                models,
+                listed,
+            });
+        }
+        Ok(config)
+    }
+
+    /// List mode: the per-model variables were the defaults of the list's
+    /// entries (`model_list::ModelDefaults`), not a model of this process's
+    /// own. Their fields go back to unset, so nothing outside the list can
+    /// serve, admit or bill as a model.
+    fn unset_single_model(&mut self) {
+        self.backend_token = None;
+        self.backend_priority = None;
+        self.discount_to_user = None;
+        self.capacity_requests_per_minute = 0;
+        self.reasoning_off_effort = "none".to_string();
+        self.admission_max_inflight = 0;
+        self.admission_start_inflight = 0;
+        self.admission_queue_saturated_at = 1;
+        self.affinity_hold_at_limit = false;
+        self.admission_tier_borrowing = false;
+        self.admission_long_max_inflight_per_host = 0;
+        self.admission_long_reserved_inflight = 0;
+        self.long_context_above_tokens = 0;
+        self.backend_tier_strict = false;
+    }
+
+    /// The one model of a single-model process, in the shape an entry of a
+    /// model list resolves to: the same values configure the same model
+    /// either way.
+    /// The caller label of the config token `token` presents, or `None` when it
+    /// is not one of `tokens`. Every token is compared, so the time taken does
+    /// not depend on which one matched.
+    pub fn config_token_caller(&self, token: &str) -> Option<&'static str> {
+        let mut matched = None;
+        for (index, trusted) in self.tokens.iter().enumerate() {
+            if crate::auth::token_eq(token, trusted) && matched.is_none() {
+                matched = Some(index);
+            }
+        }
+        matched.map(|index| {
+            self.token_labels
+                .get(index)
+                .copied()
+                .unwrap_or(crate::auth::CALLER_UNLABELED)
+        })
+    }
+
+    pub fn single_model(&self) -> crate::model_list::ModelConfig {
+        crate::model_list::ModelConfig {
+            id: self.model_name.clone(),
+            backend_urls: self.backend_urls.clone(),
+            backend_probe_urls: self.backend_probe_urls.clone(),
+            backend_long_context_urls: self.backend_long_context_urls.clone(),
+            backend_long_context_probe_urls: self.backend_long_context_probe_urls.clone(),
+            // A key of the list file only: no variable sets it.
+            backend_max_inflight: Vec::new(),
+            backend_long_context_max_inflight: Vec::new(),
+            long_context_above_tokens: self.long_context_above_tokens,
+            backend_tier_strict: self.backend_tier_strict,
+            admission_max_inflight: self.admission_max_inflight,
+            admission_start_inflight: self.admission_start_inflight,
+            admission_queue_saturated_at: self.admission_queue_saturated_at,
+            affinity_hold_at_limit: self.affinity_hold_at_limit,
+            admission_tier_borrowing: self.admission_tier_borrowing,
+            admission_long_max_inflight_per_host: self.admission_long_max_inflight_per_host,
+            admission_long_reserved_inflight: self.admission_long_reserved_inflight,
+            capacity_requests_per_minute: self.capacity_requests_per_minute,
+            discount_to_user: self.discount_to_user,
+            reasoning_off_effort: self.reasoning_off_effort.clone(),
+            // A key of the list file only: no variable sets it.
+            reasoning_effort_map: crate::reasoning::EffortMap::default(),
+            // Likewise: a process without a list never merges.
+            merge_system_messages: false,
+            backend_token: self.backend_token.clone(),
+            backend_priority: self.backend_priority,
+        }
+    }
+
+    /// Engine-load probe URLs in pool order: the base tier, then the
+    /// long-context one, matching how `BackendPool` is built.
+    pub fn pool_probe_urls(&self) -> Vec<String> {
+        self.backend_probe_urls
+            .iter()
+            .chain(&self.backend_long_context_probe_urls)
+            .cloned()
+            .collect()
+    }
+
+    /// Replica state publishing settings, `None` unless `REPLICA_STATE_REDIS_URL`
+    /// is set to a valid configuration.
+    pub fn replica_state(&self) -> Option<&crate::replica_state::config::ReplicaStateConfig> {
+        self.replica_state.as_ref()
+    }
+
+    /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
+    pub fn admission(&self) -> Option<crate::admission::AdmissionConfig> {
+        self.admission_for(&self.single_model())
+    }
+
+    /// Lane admission settings of `model`, `None` while its budget is off:
+    /// the budget, the queue threshold and the tier numbers are the model's,
+    /// the ramp, the time-to-first-token bound, the back-pressure window and
+    /// `Retry-After` are the process's.
+    pub fn admission_for(
+        &self,
+        model: &crate::model_list::ModelConfig,
+    ) -> Option<crate::admission::AdmissionConfig> {
+        if model.admission_max_inflight == 0 {
+            return None;
+        }
+        Some(crate::admission::AdmissionConfig {
+            max_inflight: model.admission_max_inflight,
+            tier_borrowing: model.admission_tier_borrowing,
+            long_max_inflight_per_host: model.admission_long_max_inflight_per_host,
+            long_reserved_inflight: model.admission_long_reserved_inflight,
+            start_inflight: model.admission_start_inflight,
+            ramp_step: self.admission_ramp_step,
+            ramp_interval: std::time::Duration::from_secs(self.admission_ramp_interval_secs),
+            ttft_p95_max: (self.admission_ttft_p95_max_ms > 0)
+                .then(|| std::time::Duration::from_millis(self.admission_ttft_p95_max_ms)),
+            backpressure_ttl: std::time::Duration::from_secs(self.admission_backpressure_secs),
+            queue_saturated_at: model.admission_queue_saturated_at,
+            retry_after: std::time::Duration::from_secs(self.admission_retry_after_secs),
+        })
+    }
+
+    /// How long a streaming request of this estimated prompt size may go
+    /// without an upstream answer before it is refused. `None` when the
+    /// feature is off, and when the computed deadline is above
+    /// `first_token_deadline_max_ms`: those requests keep the commit window.
+    pub fn first_token_deadline(
+        &self,
+        estimated_prompt_tokens: u64,
+    ) -> Option<std::time::Duration> {
+        if self.first_token_deadline_ms == 0 {
+            return None;
+        }
+        // In u128 so the slope is divided before anything can saturate: a
+        // saturating multiply would flatten every large prompt onto the same
+        // deadline.
+        let deadline_ms = u64::try_from(
+            u128::from(self.first_token_deadline_ms)
+                + u128::from(self.first_token_deadline_per_1k_tokens_ms)
+                    * u128::from(estimated_prompt_tokens)
+                    / 1_000,
+        )
+        .unwrap_or(u64::MAX);
+        if self.first_token_deadline_max_ms > 0 && deadline_ms > self.first_token_deadline_max_ms {
+            return None;
+        }
+        Some(std::time::Duration::from_millis(deadline_ms))
+    }
+
+    /// Media inlining policy with the SSRF host rules and the domain allowlist
+    /// shared with image validation.
+    pub fn media_inline(&self) -> crate::media_inline::MediaInlineConfig {
+        crate::media_inline::MediaInlineConfig {
+            allow_private_hosts: self.image_validation_allow_private_hosts,
+            allowed_domains: self.image_validation_allowed_domains.clone(),
+            ..self.media_inline.clone()
+        }
+    }
+
+    /// Build the runtime config for pre-dispatch image validation.
+    pub fn image_validation(&self) -> crate::image_validation::ImageValidationConfig {
+        crate::image_validation::ImageValidationConfig {
+            enabled: self.image_validation_enabled,
+            timeout: std::time::Duration::from_secs(self.image_validation_timeout_secs),
+            max_bytes: self.image_validation_max_bytes,
+            max_concurrency: self.image_validation_max_concurrency,
+            allow_private_hosts: self.image_validation_allow_private_hosts,
+            allowed_domains: self.image_validation_allowed_domains.clone(),
+            reject_non_rgb_images: self.image_validation_reject_non_rgb_images,
+            reject_single_channel_images: self.image_validation_reject_single_channel_images,
+        }
+    }
+}
+
+/// Longest caller label `TOKEN_LABELS` accepts.
+const MAX_TOKEN_LABEL_LEN: usize = 32;
+
+/// Parse `TOKEN_LABELS`: one label per non-empty `TOKEN` entry, in order.
+/// Unset or blank means no labels (every token is `unlabeled`), so a
+/// deployment without the variable runs exactly as before. A label is
+/// lowercase ASCII letters, digits, `-` and `_`, starts with a letter or
+/// digit, is at most 32 bytes, is not one of the values the proxy uses for
+/// other callers, and is never equal to a token. The labels are leaked once at
+/// startup so request paths can carry them as `&'static str` metric labels.
+fn parse_token_labels(raw: Option<&str>, tokens: &[String]) -> anyhow::Result<Vec<&'static str>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let labels: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if labels.len() != tokens.len() {
+        anyhow::bail!(
+            "TOKEN_LABELS has {} entries but TOKEN has {} tokens: give exactly one label per token, in the same order",
+            labels.len(),
+            tokens.len()
+        );
+    }
+    labels
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let well_formed = !label.is_empty()
+                && label.len() <= MAX_TOKEN_LABEL_LEN
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+                && label
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+            if !well_formed {
+                anyhow::bail!(
+                    "TOKEN_LABELS entry {} is not a valid label: use 1-{MAX_TOKEN_LABEL_LEN} lowercase letters, digits, '-' or '_'",
+                    index + 1
+                );
+            }
+            if tokens.iter().any(|token| token == label) {
+                anyhow::bail!("TOKEN_LABELS entry {} must not be a token", index + 1);
+            }
+            if crate::auth::RESERVED_CALLERS.contains(&label) {
+                anyhow::bail!(
+                    "TOKEN_LABELS entry {} is a reserved caller value ({label})",
+                    index + 1
+                );
+            }
+            Ok(&*Box::leak(label.to_string().into_boxed_str()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Serialize env-modifying tests to avoid races
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env_vars<F, R>(vars: &[(&str, &str)], f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Capture old values
+        let old_values: Vec<(&str, Option<String>)> =
+            vars.iter().map(|(k, _)| (*k, env::var(k).ok())).collect();
+        // Set new values
+        for (k, v) in vars {
+            env::set_var(k, v);
+        }
+        let result = f();
+        // Restore old values
+        for (k, old) in &old_values {
+            match old {
+                Some(v) => env::set_var(k, v),
+                None => env::remove_var(k),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn test_ohttp_max_inflight_default_override_and_garbage() {
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let with = |value: &'static str| {
+            let mut vars = base.to_vec();
+            vars.push(("OHTTP_MAX_INFLIGHT", value));
+            with_env_vars(&vars, Config::from_env)
+        };
+        // Empty = unset: the default cap.
+        assert_eq!(
+            with("").unwrap().ohttp_max_inflight,
+            DEFAULT_OHTTP_MAX_INFLIGHT
+        );
+        assert_eq!(with("16").unwrap().ohttp_max_inflight, 16);
+        // 0 turns the cap off.
+        assert_eq!(with("0").unwrap().ohttp_max_inflight, 0);
+        let err = with("lots").unwrap_err().to_string();
+        assert!(err.contains("OHTTP_MAX_INFLIGHT"), "{err}");
+    }
+
+    #[test]
+    fn attestation_max_inflight_configuration() {
+        let load = |limit| {
+            with_env_vars(
+                &[
+                    ("TOKEN", "t"),
+                    ("MODEL_NAME", "m"),
+                    ("ATTESTATION_MAX_INFLIGHT", limit),
+                ],
+                Config::from_env,
+            )
+        };
+        assert_eq!(
+            load("").unwrap().attestation_max_inflight,
+            crate::attestation::DEFAULT_ATTESTATION_MAX_INFLIGHT
+        );
+        assert_eq!(load("2").unwrap().attestation_max_inflight, 2);
+        for invalid in ["0", "invalid", &usize::MAX.to_string()] {
+            assert!(load(invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("ATTESTATION_MAX_INFLIGHT"));
+        }
+    }
+
+    #[test]
+    fn test_rerank_limits_default_override_and_invalid() {
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut vars = base.to_vec();
+            vars.extend_from_slice(extra);
+            with_env_vars(&vars, Config::from_env)
+        };
+        assert_eq!(
+            with(&[]).unwrap().rerank_limits,
+            crate::rerank_limit::RerankLimits::default()
+        );
+        let config = with(&[
+            ("VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE", "4"),
+            ("VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT", "32"),
+            ("VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED", "8"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.rerank_limits,
+            crate::rerank_limit::RerankLimits {
+                per_workspace: 4,
+                direct: 32,
+                trusted: 8,
+            }
+        );
+        for name in [
+            "VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE",
+            "VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT",
+            "VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED",
+        ] {
+            let err = with(&[(name, "0")]).unwrap_err().to_string();
+            assert!(err.contains(name));
+            let err = with(&[(name, "many")]).unwrap_err().to_string();
+            assert!(err.contains(name));
+        }
+    }
+
+    #[test]
+    fn test_backend_lora_requires_strict_request_model() {
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut vars = base.to_vec();
+            vars.extend_from_slice(extra);
+            with_env_vars(&vars, Config::from_env)
+        };
+        let lora = ("VLLM_PROXY_BACKEND_LORA", "abliterated");
+        let strict = ("VLLM_PROXY_STRICT_REQUEST_MODEL", "1");
+        let off = ("VLLM_PROXY_STRICT_REQUEST_MODEL", "");
+        let error = with(&[lora, off]).unwrap_err().to_string();
+        assert!(error.contains("VLLM_PROXY_STRICT_REQUEST_MODEL"), "{error}");
+        let config = with(&[lora, strict]).unwrap();
+        assert_eq!(config.backend_lora.as_deref(), Some("abliterated"));
+        assert!(config.strict_request_model);
+        // Neither is on by default.
+        let config = with(&[off]).unwrap();
+        assert!(config.backend_lora.is_none() && !config.strict_request_model);
+    }
+
+    #[test]
+    fn test_config_requires_model_name() {
+        with_env_vars(&[("TOKEN", "test")], || {
+            env::remove_var("MODEL_NAME");
+            let result = Config::from_env();
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("MODEL_NAME"));
+        });
+    }
+
+    #[test]
+    fn test_config_requires_token() {
+        with_env_vars(&[("MODEL_NAME", "test")], || {
+            env::remove_var("TOKEN");
+            let result = Config::from_env();
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("TOKEN"));
+        });
+    }
+
+    #[test]
+    fn test_config_rejects_empty_token() {
+        with_env_vars(&[("MODEL_NAME", "test"), ("TOKEN", "")], || {
+            let result = Config::from_env();
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("at least one non-empty token"));
+        });
+    }
+
+    #[test]
+    fn test_config_rejects_token_list_of_only_empties() {
+        with_env_vars(&[("MODEL_NAME", "test"), ("TOKEN", " , , ")], || {
+            let result = Config::from_env();
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("at least one non-empty token"));
+        });
+    }
+
+    #[test]
+    fn test_config_token_labels_default_to_unlabeled() {
+        with_env_vars(&[("MODEL_NAME", "test"), ("TOKEN", "tok-a,tok-b")], || {
+            env::remove_var("TOKEN_LABELS");
+            let config = Config::from_env().unwrap();
+            assert!(config.token_labels.is_empty());
+            assert_eq!(config.config_token_caller("tok-a"), Some("unlabeled"));
+            assert_eq!(config.config_token_caller("tok-b"), Some("unlabeled"));
+            assert_eq!(config.config_token_caller("tok-c"), None);
+            assert_eq!(config.config_token_caller(""), None);
+        });
+        // Blank is the same as unset.
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "test"),
+                ("TOKEN", "tok-a"),
+                ("TOKEN_LABELS", "  "),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.config_token_caller("tok-a"), Some("unlabeled"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_token_labels_follow_token_order() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "test"),
+                ("TOKEN", "tok-a, ,tok-b,tok-c"),
+                ("TOKEN_LABELS", "cloud-api, gateway ,probe"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.token_labels, vec!["cloud-api", "gateway", "probe"]);
+                assert_eq!(config.config_token_caller("tok-a"), Some("cloud-api"));
+                assert_eq!(config.config_token_caller("tok-b"), Some("gateway"));
+                assert_eq!(config.config_token_caller("tok-c"), Some("probe"));
+                assert_eq!(config.config_token_caller("tok-d"), None);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_token_labels_rejects_bad_values() {
+        for (tokens, labels, expected) in [
+            ("tok-a,tok-b", "cloud-api", "exactly one label per token"),
+            ("tok-a", "cloud-api,gateway", "exactly one label per token"),
+            ("tok-a,tok-b", "cloud-api,", "not a valid label"),
+            ("tok-a", "Cloud-API", "not a valid label"),
+            ("tok-a", "-ops", "not a valid label"),
+            ("tok-a", "ops team", "not a valid label"),
+            (
+                "tok-a",
+                "a234567890123456789012345678901234",
+                "not a valid label",
+            ),
+            ("tok-a", "api_key", "reserved"),
+            ("tok-a", "unknown", "reserved"),
+            ("tok-a", "unlabeled", "reserved"),
+            ("secret1", "secret1", "must not be a token"),
+        ] {
+            with_env_vars(
+                &[
+                    ("MODEL_NAME", "test"),
+                    ("TOKEN", tokens),
+                    ("TOKEN_LABELS", labels),
+                ],
+                || {
+                    let error = Config::from_env().unwrap_err().to_string();
+                    assert!(error.contains(expected), "{labels}: {error}");
+                    assert!(!error.contains("secret1"), "{error}");
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_parses_multiple_tokens() {
+        with_env_vars(
+            &[("MODEL_NAME", "test"), ("TOKEN", "tok-a, tok-b ,tok-c")],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.tokens, vec!["tok-a", "tok-b", "tok-c"]);
+            },
+        );
+    }
+
+    fn gateway_env_cleanup() {
+        for key in [
+            "VLLM_BACKEND_URLS",
+            "VLLM_DATA_PARALLEL_SIZE",
+            "VLLM_BACKEND_TOKEN",
+            "VLLM_BACKEND_PRIORITY",
+            "VLLM_BACKEND_HEALTH_PATH",
+            "NON_TEE_DEPLOYMENT",
+            "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
+            "VLLM_PROXY_PRIORITY_LOWER_FIRST",
+            "VLLM_PROXY_PRIORITY_SIZE_TIERS",
+            "VLLM_PROXY_STREAM_ERROR_PEEK_MS",
+            "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+            "VLLM_PROXY_MODELS_DOCUMENT_URL",
+            "VLLM_PROXY_DISCOUNT_TO_USER",
+            "VLLM_PROXY_ALLOWED_ORG_IDS",
+            "VLLM_PROXY_SSE_KEEPALIVE_SECS",
+            "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS",
+            "VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS",
+            "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS",
+            "VLLM_PROXY_ADMISSION_TIER_BORROWING",
+            "VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST",
+            "VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT",
+            "VLLM_PROXY_ADMISSION_MAX_INFLIGHT",
+            "VLLM_PROXY_ADMISSION_START_INFLIGHT",
+            "VLLM_PROXY_ADMISSION_RAMP_STEP",
+            "VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS",
+            "VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS",
+            "VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS",
+            "VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT",
+            "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
+            "VLLM_BACKEND_CONNECT_FAILOVER",
+            "VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT",
+            "VLLM_BACKEND_MAX_INFLIGHT",
+            "VLLM_BACKEND_PROBE_URLS",
+            "VLLM_BACKEND_PROBE_INTERVAL_SECS",
+            "VLLM_BACKEND_LONG_CONTEXT_URLS",
+            "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
+            "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS",
+            "VLLM_BACKEND_TIER_STRICT",
+            "LISTEN_ADDR",
+        ]
+        .into_iter()
+        .chain(USAGE_REPORT_ENV)
+        {
+            env::remove_var(key);
+        }
+    }
+
+    const USAGE_REPORT_ENV: [&str; 13] = [
+        "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS",
+        "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS",
+        "VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS",
+        "VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS",
+        "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT",
+        "VLLM_PROXY_USAGE_REPORT_MAX_QUEUED",
+        "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS",
+        "VLLM_PROXY_USAGE_REPORT_TRANSPORT",
+        "VLLM_PROXY_USAGE_REPORT_SQS_URL",
+        "VLLM_PROXY_USAGE_REPORT_SQS_REGION",
+        "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT",
+        "VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS",
+        "VLLM_PROXY_AWS_CREDENTIALS_URL",
+    ];
+
+    /// The SQS transport's defaults (5 attempts, 8 in flight) apply only to
+    /// it, and each stays overridable. HTTP keeps the one-attempt default.
+    #[test]
+    fn test_usage_report_defaults_depend_on_the_transport() {
+        use std::time::Duration;
+        const TRANSPORT: &str = "VLLM_PROXY_USAGE_REPORT_TRANSPORT";
+        const MAX_ATTEMPTS: &str = "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS";
+        const MAX_IN_FLIGHT: &str = "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT";
+        const SHUTDOWN_DRAIN: &str = "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS";
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let sqs = [
+            (TRANSPORT, "sqs"),
+            ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://sqs.example/q"),
+            ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
+        ];
+        with_clean_env(&base, &[], || {
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.max_attempts, 1);
+            assert_eq!(policy.max_in_flight, 0);
+            assert_eq!(policy.shutdown_drain, Duration::ZERO);
+        });
+        with_clean_env(&base, &sqs, || {
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.max_attempts, 5);
+            assert_eq!(policy.max_in_flight, 8);
+            assert_eq!(policy.shutdown_drain, Duration::from_secs(10));
+        });
+        let overridden: Vec<_> = sqs
+            .iter()
+            .copied()
+            .chain([
+                (MAX_ATTEMPTS, "2"),
+                (MAX_IN_FLIGHT, "4"),
+                (SHUTDOWN_DRAIN, "3"),
+            ])
+            .collect();
+        with_clean_env(&base, &overridden, || {
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.max_attempts, 2);
+            assert_eq!(policy.max_in_flight, 4);
+            assert_eq!(policy.shutdown_drain, Duration::from_secs(3));
+        });
+    }
+
+    /// The fail-closed rule for `VLLM_BACKEND_TOKEN` counts the SQS transport
+    /// as a billing path, and HTTP still needs cloud-api.
+    #[test]
+    fn test_backend_token_is_accepted_over_sqs_and_refused_over_http_without_cloud_api() {
+        const TRANSPORT: &str = "VLLM_PROXY_USAGE_REPORT_TRANSPORT";
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let token = ("VLLM_BACKEND_TOKEN", "backend-secret");
+        with_clean_env(
+            &base,
+            &[
+                token,
+                (TRANSPORT, "sqs"),
+                ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://sqs.example/q"),
+                ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
+            ],
+            || {
+                Config::from_env().expect("sqs bills without cloud-api");
+            },
+        );
+        with_clean_env(&base, &[token], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("requires billing"), "{err}");
+        });
+        // sqs selected without its endpoint still fails, from the transport's own check.
+        with_clean_env(&base, &[token, (TRANSPORT, "sqs")], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("VLLM_PROXY_USAGE_REPORT_SQS_URL"), "{err}");
+        });
+    }
+
+    #[test]
+    fn test_usage_report_delivery_is_unchanged_without_its_settings() {
+        use std::time::Duration;
+        with_clean_env(&[("MODEL_NAME", "m"), ("TOKEN", "t")], &[], || {
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy, crate::usage_report::UsageReportPolicy::default());
+            // One attempt, 5 seconds, no cap, no deadline, no drain: what a
+            // report got before any of this could be set.
+            assert_eq!(policy.attempt_timeout, Duration::from_secs(5));
+            assert_eq!(policy.max_attempts, 1);
+            assert_eq!(policy.max_in_flight, 0);
+            assert_eq!(policy.deadline, None);
+            assert_eq!(policy.shutdown_drain, Duration::ZERO);
+            // An empty value is an unset one.
+            for name in USAGE_REPORT_ENV {
+                env::set_var(name, " ");
+            }
+            assert_eq!(
+                Config::from_env().unwrap().usage_report,
+                crate::usage_report::UsageReportPolicy::default()
+            );
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_bills_usage_counts_the_sqs_transport_without_cloud_api() {
+        use crate::usage_report::{SqsSettings, UsageReportTransport};
+        let sqs = UsageReportTransport::Sqs(SqsSettings {
+            queue_url: "https://q".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            credentials_url: "http://127.0.0.1:9911".into(),
+        });
+        // SQS needs neither cloud-api's URL nor its usage token.
+        assert!(bills_usage(false, false, &sqs));
+        // HTTP needs both, as before.
+        let http = UsageReportTransport::Http;
+        assert!(!bills_usage(false, false, &http));
+        assert!(!bills_usage(true, false, &http));
+        assert!(!bills_usage(false, true, &http));
+        assert!(bills_usage(true, true, &http));
+    }
+
+    /// A fallback to HTTP gets HTTP's own policy defaults, not the SQS ones;
+    /// an explicit setting is kept either way.
+    #[test]
+    fn test_falling_back_to_http_uses_the_http_policy_defaults() {
+        use crate::usage_report::{UsageReportPolicy, UsageReportTransport};
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let sqs = [
+            ("VLLM_PROXY_USAGE_REPORT_TRANSPORT", "sqs"),
+            ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://q"),
+            ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
+        ];
+        with_clean_env(&base, &sqs, || {
+            let mut config = Config::from_env().unwrap();
+            assert_eq!(config.usage_report.max_attempts, 5);
+            assert_eq!(config.usage_report.max_in_flight, 8);
+            config.fall_back_to_http_usage_transport().unwrap();
+            assert_eq!(config.usage_report_transport, UsageReportTransport::Http);
+            assert_eq!(config.usage_report, UsageReportPolicy::default());
+        });
+        let mut overridden = sqs.to_vec();
+        overridden.push(("VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS", "3"));
+        overridden.push(("VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT", "4"));
+        with_clean_env(&base, &overridden, || {
+            let mut config = Config::from_env().unwrap();
+            config.fall_back_to_http_usage_transport().unwrap();
+            let expected = UsageReportPolicy {
+                max_attempts: 3,
+                max_in_flight: 4,
+                ..UsageReportPolicy::default()
+            };
+            assert_eq!(config.usage_report, expected);
+        });
+    }
+
+    /// The handoff of the startup check's answer to the config: an HTTP
+    /// resolution of an SQS config selects HTTP and rebuilds the policy with
+    /// HTTP's defaults (explicit settings kept); the configured transport as
+    /// the answer changes nothing.
+    #[test]
+    fn test_the_startup_resolution_is_adopted_by_the_config() {
+        use crate::usage_report::{UsageReportPolicy, UsageReportTransport};
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let sqs = [
+            ("VLLM_PROXY_USAGE_REPORT_TRANSPORT", "sqs"),
+            ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://q"),
+            ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
+            ("VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS", "3"),
+            ("VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT", "4"),
+        ];
+        with_clean_env(&base, &sqs, || {
+            let mut config = Config::from_env().unwrap();
+            let configured = config.usage_report_transport.clone();
+            assert!(matches!(configured, UsageReportTransport::Sqs(_)));
+            let sqs_policy = config.usage_report.clone();
+            assert_ne!(sqs_policy, UsageReportPolicy::default());
+
+            // The queue passed its check: nothing changes.
+            assert!(!config.adopt_usage_transport(configured.clone()).unwrap());
+            assert_eq!(config.usage_report_transport, configured);
+            assert_eq!(config.usage_report, sqs_policy);
+
+            // The queue failed its check and HTTP is the answer.
+            assert!(config
+                .adopt_usage_transport(UsageReportTransport::Http)
+                .unwrap());
+            assert_eq!(config.usage_report_transport, UsageReportTransport::Http);
+            assert_eq!(
+                config.usage_report,
+                UsageReportPolicy {
+                    max_attempts: 3,
+                    max_in_flight: 4,
+                    ..UsageReportPolicy::default()
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn test_usage_report_transport_defaults_to_http_and_sqs_needs_a_queue() {
+        use crate::usage_report::{SqsSettings, UsageReportTransport};
+        const TRANSPORT: &str = "VLLM_PROXY_USAGE_REPORT_TRANSPORT";
+        const SQS_URL: &str = "VLLM_PROXY_USAGE_REPORT_SQS_URL";
+        const SQS_REGION: &str = "VLLM_PROXY_USAGE_REPORT_SQS_REGION";
+        const CREDENTIALS_URL: &str = "VLLM_PROXY_AWS_CREDENTIALS_URL";
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+
+        with_clean_env(&base, &[], || {
+            assert_eq!(
+                Config::from_env().unwrap().usage_report_transport,
+                UsageReportTransport::Http
+            );
+        });
+        // An empty value is an unset one, and the transport is named exactly.
+        with_clean_env(&base, &[(TRANSPORT, " ")], || {
+            assert_eq!(
+                Config::from_env().unwrap().usage_report_transport,
+                UsageReportTransport::Http
+            );
+        });
+        with_clean_env(
+            &base,
+            &[
+                (TRANSPORT, "sqs"),
+                (SQS_URL, "https://sqs.example/123/usage"),
+                (SQS_REGION, "eu-west-1"),
+                (CREDENTIALS_URL, "http://127.0.0.1:9911"),
+            ],
+            || {
+                assert_eq!(
+                    Config::from_env().unwrap().usage_report_transport,
+                    UsageReportTransport::Sqs(SqsSettings {
+                        queue_url: "https://sqs.example/123/usage".into(),
+                        region: "eu-west-1".into(),
+                        endpoint: None,
+                        credentials_url: "http://127.0.0.1:9911".into(),
+                    })
+                );
+            },
+        );
+        // The region defaults; the queue does not.
+        with_clean_env(
+            &base,
+            &[
+                (TRANSPORT, "sqs"),
+                (SQS_URL, "https://q"),
+                (CREDENTIALS_URL, "http://127.0.0.1:9911"),
+            ],
+            || match Config::from_env().unwrap().usage_report_transport {
+                UsageReportTransport::Sqs(settings) => {
+                    assert_eq!(settings.region, "us-east-1");
+                }
+                other => panic!("expected sqs, got {other:?}"),
+            },
+        );
+        // Selected without its credentials endpoint: startup fails.
+        with_clean_env(&base, &[(TRANSPORT, "sqs"), (SQS_URL, "https://q")], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains(CREDENTIALS_URL), "{err}");
+        });
+        // URLs that would carry credentials or signed usage in the clear fail
+        // startup; loopback http and any https are accepted.
+        let sqs_env = |queue: &'static str, creds: &'static str, endpoint: Option<&'static str>| {
+            let mut vars = vec![
+                (TRANSPORT, "sqs"),
+                (SQS_URL, queue),
+                (CREDENTIALS_URL, creds),
+            ];
+            if let Some(endpoint) = endpoint {
+                vars.push(("VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT", endpoint));
+            }
+            vars
+        };
+        for (queue, creds, endpoint) in [
+            ("https://q", "http://127.0.0.1:9911", None),
+            ("https://q", "http://127.9.9.9:9911/", None),
+            ("https://q", "http://localhost:9911", None),
+            ("https://q", "http://[::1]:9911", None),
+            ("https://q", "https://imds.internal", None),
+            (
+                "http://127.0.0.1:4566/q",
+                "http://127.0.0.1:9911",
+                Some("http://localhost:4566"),
+            ),
+            (
+                "https://q",
+                "http://127.0.0.1:9911",
+                Some("https://sqs.eu-west-1.amazonaws.com"),
+            ),
+        ] {
+            with_clean_env(&base, &sqs_env(queue, creds, endpoint), || {
+                Config::from_env().unwrap();
+            });
+        }
+        for (queue, creds, endpoint, named) in [
+            ("https://q", "http://169.254.169.254", None, CREDENTIALS_URL),
+            (
+                "https://q",
+                "http://imds.example:9911",
+                None,
+                CREDENTIALS_URL,
+            ),
+            (
+                "https://q",
+                "http://localhost.evil.com",
+                None,
+                CREDENTIALS_URL,
+            ),
+            ("https://q", "ftp://127.0.0.1", None, CREDENTIALS_URL),
+            ("https://q", "127.0.0.1:9911", None, CREDENTIALS_URL),
+            (
+                "http://sqs.example/q",
+                "http://127.0.0.1:9911",
+                None,
+                SQS_URL,
+            ),
+            (
+                "https://q",
+                "http://127.0.0.1:9911",
+                Some("http://sqs.example"),
+                "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT",
+            ),
+            (
+                "https://q",
+                "http://127.0.0.1:9911",
+                Some("file:///etc/passwd"),
+                "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT",
+            ),
+        ] {
+            with_clean_env(&base, &sqs_env(queue, creds, endpoint), || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(named), "{err}");
+            });
+        }
+        // The test-only opt-in accepts plain http to non-loopback hosts (a
+        // compose network's emulators), and nothing else: off by default,
+        // the same URLs fail startup, and a non-http(s) scheme still does.
+        const ALLOW_INSECURE: &str = "VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS";
+        let insecure = |insecure_flag: &'static str| {
+            let mut vars = sqs_env(
+                "http://elasticmq:9324/queue/usage",
+                "http://imds.internal:9911",
+                Some("http://elasticmq:9324"),
+            );
+            vars.push((ALLOW_INSECURE, insecure_flag));
+            vars
+        };
+        for flag in ["", "0", "false"] {
+            with_clean_env(&base, &insecure(flag), || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(SQS_URL), "{err}");
+            });
+        }
+        with_clean_env(&base, &insecure("1"), || {
+            let UsageReportTransport::Sqs(settings) =
+                Config::from_env().unwrap().usage_report_transport
+            else {
+                panic!("expected the sqs transport");
+            };
+            assert_eq!(settings.queue_url, "http://elasticmq:9324/queue/usage");
+            assert_eq!(settings.credentials_url, "http://imds.internal:9911");
+        });
+        let mut vars = sqs_env("https://q", "ftp://imds.internal", None);
+        vars.push((ALLOW_INSECURE, "1"));
+        with_clean_env(&base, &vars, || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains(CREDENTIALS_URL), "{err}");
+        });
+        // A region that is not a region name fails startup.
+        with_clean_env(
+            &base,
+            &[
+                (TRANSPORT, "sqs"),
+                (SQS_URL, "https://q"),
+                (SQS_REGION, "us-east-1.evil"),
+                (CREDENTIALS_URL, "http://127.0.0.1:9911"),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(SQS_REGION), "{err}");
+            },
+        );
+        with_clean_env(&base, &[(TRANSPORT, "sqs")], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains(SQS_URL), "{err}");
+        });
+        with_clean_env(&base, &[(TRANSPORT, "kafka")], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains(TRANSPORT) && err.contains("kafka"), "{err}");
+        });
+    }
+
+    #[test]
+    fn test_usage_report_settings_parse_and_validate() {
+        use std::time::Duration;
+        const TIMEOUT: &str = "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS";
+        const MAX_ATTEMPTS: &str = "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS";
+        const INITIAL_BACKOFF: &str = "VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS";
+        const DEADLINE: &str = "VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS";
+        const MAX_IN_FLIGHT: &str = "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT";
+        const MAX_QUEUED: &str = "VLLM_PROXY_USAGE_REPORT_MAX_QUEUED";
+        const SHUTDOWN_DRAIN: &str = "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS";
+        // The settings docs/gateway-mode.md suggests for a lane.
+        let lane = [
+            (TIMEOUT, "30"),
+            (MAX_ATTEMPTS, "5"),
+            (INITIAL_BACKOFF, "5000"),
+            (DEADLINE, "300"),
+            (MAX_IN_FLIGHT, "8"),
+        ];
+        with_clean_env(&[("MODEL_NAME", "m"), ("TOKEN", "t")], &lane, || {
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(
+                policy,
+                crate::usage_report::UsageReportPolicy {
+                    attempt_timeout: Duration::from_secs(30),
+                    max_attempts: 5,
+                    initial_backoff: Duration::from_secs(5),
+                    deadline: Some(Duration::from_secs(300)),
+                    max_in_flight: 8,
+                    max_queued: 10_000,
+                    shutdown_drain: Duration::ZERO,
+                }
+            );
+            env::set_var(INITIAL_BACKOFF, "250");
+            env::set_var(MAX_QUEUED, "2000");
+            env::set_var(SHUTDOWN_DRAIN, "20");
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.initial_backoff, Duration::from_millis(250));
+            assert_eq!(policy.max_queued, 2_000);
+            assert_eq!(policy.shutdown_drain, Duration::from_secs(20));
+
+            // What cannot work fails startup, naming the variable.
+            for (name, bad, restored) in [
+                (TIMEOUT, "0", "30"),
+                (TIMEOUT, "301", "30"),
+                (TIMEOUT, "soon", "30"),
+                (MAX_ATTEMPTS, "0", "5"),
+                (MAX_ATTEMPTS, "11", "5"),
+                (MAX_ATTEMPTS, "-1", "5"),
+                (INITIAL_BACKOFF, "0", "250"),
+                (INITIAL_BACKOFF, "30001", "250"),
+                // Nothing would be left to wait or to back off in, and no
+                // attempt could start.
+                (DEADLINE, "30", "300"),
+                (DEADLINE, "29", "300"),
+                // More time for a report only under a cap, with its queue.
+                (MAX_IN_FLIGHT, "0", "8"),
+                (MAX_IN_FLIGHT, "", "8"),
+                (MAX_IN_FLIGHT, "1001", "8"),
+                (MAX_QUEUED, "0", "2000"),
+                (MAX_QUEUED, "100001", "2000"),
+                (SHUTDOWN_DRAIN, "601", "20"),
+            ] {
+                env::set_var(name, bad);
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(name), "{name}={bad}: {err}");
+                env::set_var(name, restored);
+            }
+            assert!(Config::from_env().is_ok());
+
+            // Without a cap a report gets what it always got and no more:
+            // one attempt, and a timeout of 5 seconds at most.
+            env::set_var(MAX_IN_FLIGHT, "0");
+            env::set_var(MAX_ATTEMPTS, "1");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(
+                err.contains(TIMEOUT) && err.contains(MAX_IN_FLIGHT),
+                "{err}"
+            );
+            env::set_var(TIMEOUT, "5");
+            env::set_var(MAX_ATTEMPTS, "2");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains(MAX_IN_FLIGHT), "{err}");
+            env::set_var(MAX_ATTEMPTS, "1");
+            env::set_var(TIMEOUT, "3");
+            env::set_var(INITIAL_BACKOFF, "0");
+            env::set_var(DEADLINE, "0");
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.attempt_timeout, Duration::from_secs(3));
+            assert_eq!((policy.max_attempts, policy.max_in_flight), (1, 0));
+            assert_eq!(policy.deadline, None);
+            // And a cap alone is a policy too.
+            env::set_var(TIMEOUT, "");
+            env::set_var(MAX_IN_FLIGHT, "8");
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.attempt_timeout, Duration::from_secs(5));
+            assert_eq!((policy.max_attempts, policy.max_in_flight), (1, 8));
+            gateway_env_cleanup();
+        });
+
+        // One delivery per process: a model list takes the same settings.
+        with_model_list(&two_models(), &lane, || {
+            let config = Config::from_env().unwrap();
+            assert!(config.model_list.is_some());
+            assert_eq!(config.usage_report.max_in_flight, 8);
+            assert_eq!(config.usage_report.max_attempts, 5);
+        });
+    }
+
+    #[test]
+    fn replica_state_is_parsed_by_config_and_invalid_values_only_disable_it() {
+        let base = [
+            ("MODEL_NAME", "m"),
+            ("TOKEN", "t"),
+            ("VLLM_BACKEND_URLS", "http://a:8000"),
+            ("VLLM_BACKEND_LONG_CONTEXT_URLS", "http://b:8000"),
+            ("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "32000"),
+            ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
+            ("REPLICA_STATE_HOST_ID", "gpu01"),
+        ];
+        with_env_vars(&base, || {
+            let config = Config::from_env().unwrap();
+            let rs = config.replica_state().expect("replica state configured");
+            assert_eq!(rs.host_id, "gpu01");
+        });
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            assert!(Config::from_env().unwrap().replica_state().is_none());
+        });
+    }
+
+    #[test]
+    fn test_gateway_defaults_leave_existing_deployments_unchanged() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.listen_addr, "0.0.0.0");
+            assert!(config.backend_token.is_none());
+            assert!(config.backend_priority.is_none());
+            assert_eq!(config.backend_health_path, "/health");
+            assert!(!config.non_tee_deployment);
+            assert!(!config.map_queue_full_to_429);
+            assert!(!config.priority_lower_first);
+            assert!(config.priority_size_tiers.is_none());
+            assert_eq!(config.stream_error_peek_ms, 0);
+            assert_eq!(config.stream_commit_ms, 0);
+            assert_eq!(config.first_token_deadline_ms, 0);
+            assert!(config.first_token_deadline(1_000).is_none());
+            assert!(config.rejected_content_part_types.is_empty());
+            assert!(config.discount_to_user.is_none());
+            assert!(config.allowed_org_ids.is_empty());
+            assert_eq!(config.sse_keepalive_secs, 0);
+            assert_eq!(config.admission_max_inflight, 0);
+            assert!(config.admission().is_none());
+            assert!(!config.backend_connect_failover);
+            assert!(config.backend_probe_urls.is_empty());
+            assert_eq!(config.backend_probe_interval_secs, 2);
+            assert!(config.backend_long_context_urls.is_empty());
+            assert!(config.pool_probe_urls().is_empty());
+            assert_eq!(config.long_context_above_tokens, 0);
+            assert!(!config.backend_tier_strict);
+            assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
+        });
+    }
+
+    #[test]
+    fn test_first_token_deadline_grows_with_the_prompt_and_exempts_above_the_cap() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS", "8500");
+            // Base only: every request gets the same deadline.
+            let config = Config::from_env().unwrap();
+            let ms = |tokens| config.first_token_deadline(tokens).map(|d| d.as_millis());
+            assert_eq!(ms(0), Some(8_500));
+            assert_eq!(ms(200_000), Some(8_500));
+
+            // With the slope: 0.8 ms per estimated prompt token.
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS", "800");
+            let config = Config::from_env().unwrap();
+            let ms = |tokens| config.first_token_deadline(tokens).map(|d| d.as_millis());
+            assert_eq!(ms(0), Some(8_500));
+            assert_eq!(ms(1_000), Some(9_300));
+            assert_eq!(ms(26_875), Some(30_000));
+            // No cap: a 200k-token prompt still gets a deadline, a long one.
+            assert_eq!(ms(200_000), Some(168_500));
+
+            // The slope is applied before anything can overflow, so even an
+            // absurd one keeps ordering prompts by size instead of flattening
+            // them onto the same deadline.
+            env::set_var(
+                "VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS",
+                u64::MAX.to_string(),
+            );
+            let config = Config::from_env().unwrap();
+            assert!(config.first_token_deadline(1) < config.first_token_deadline(2));
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS", "800");
+
+            // With the cap: above it a request keeps today's behavior.
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS", "30000");
+            let config = Config::from_env().unwrap();
+            let ms = |tokens| config.first_token_deadline(tokens).map(|d| d.as_millis());
+            assert_eq!(ms(26_875), Some(30_000), "exactly the cap still counts");
+            assert_eq!(ms(40_000), None);
+            assert_eq!(ms(200_000), None);
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_first_token_deadline_slope_and_cap_are_validated() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            // A slope or a cap on its own would do nothing.
+            for orphan in [
+                "VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS",
+                "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS",
+            ] {
+                env::set_var(orphan, "800");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS"), "{err}");
+                env::remove_var(orphan);
+            }
+            // A cap below the base would exempt every request.
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS", "8500");
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS", "8000");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(
+                err.contains("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS"),
+                "{err}"
+            );
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS", "8500");
+            assert!(Config::from_env().is_ok());
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_gateway_settings_parse() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_TOKEN", " backend-secret "),
+                ("CLOUD_API_URL", "https://cloud-api.test"),
+                ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+                ("VLLM_BACKEND_HEALTH_PATH", "/healthz"),
+                ("NON_TEE_DEPLOYMENT", "1"),
+                ("VLLM_PROXY_MAP_QUEUE_FULL_TO_429", "1"),
+                ("VLLM_PROXY_PRIORITY_LOWER_FIRST", "1"),
+                ("VLLM_PROXY_STREAM_ERROR_PEEK_MS", "750"),
+                (
+                    "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+                    "video_url, input_audio",
+                ),
+                ("VLLM_PROXY_SSE_KEEPALIVE_SECS", "15"),
+                ("LISTEN_ADDR", "127.0.0.1"),
+                ("VLLM_PROXY_ALLOWED_ORG_IDS", " org-a, org-b ,,"),
+            ],
+            || {
+                env::remove_var("VLLM_BACKEND_URLS");
+                env::remove_var("VLLM_DATA_PARALLEL_SIZE");
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.allowed_org_ids, vec!["org-a", "org-b"]);
+                assert_eq!(config.backend_token.as_deref(), Some("backend-secret"));
+                assert_eq!(config.backend_health_path, "/healthz");
+                assert!(config.non_tee_deployment);
+                assert!(config.map_queue_full_to_429);
+                assert!(config.priority_lower_first);
+                assert_eq!(config.stream_error_peek_ms, 750);
+                assert_eq!(
+                    config.rejected_content_part_types,
+                    vec!["video_url", "input_audio"]
+                );
+                assert_eq!(config.sse_keepalive_secs, 15);
+                assert_eq!(config.listen_addr, "127.0.0.1");
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_priority_size_tiers_env() {
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let with = |value: &'static str| {
+            let mut vars = base.to_vec();
+            vars.push(("VLLM_PROXY_PRIORITY_SIZE_TIERS", value));
+            vars
+        };
+        with_env_vars(&with("16000:10, 65536:5, *:0"), || {
+            let config = Config::from_env().unwrap();
+            let tiers = config.priority_size_tiers.unwrap();
+            assert_eq!(tiers.classify(16000), (0, 10));
+            assert_eq!(tiers.classify(65536), (1, 5));
+            assert_eq!(tiers.classify(65537), (2, 0));
+            gateway_env_cleanup();
+        });
+        with_env_vars(&with("  "), || {
+            assert!(Config::from_env().unwrap().priority_size_tiers.is_none());
+            gateway_env_cleanup();
+        });
+        with_env_vars(&with("16000:10"), || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("VLLM_PROXY_PRIORITY_SIZE_TIERS"), "{err}");
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_backend_priority_parses_and_validates() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_PRIORITY", " -1 "),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.backend_priority, Some(-1));
+                for bad in ["high", "1.5", "5000"] {
+                    env::set_var("VLLM_BACKEND_PRIORITY", bad);
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(err.contains("VLLM_BACKEND_PRIORITY"), "{bad}: {err}");
+                }
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_discount_to_user_parses_and_validates() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            env::set_var(
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "https://cloud-api.test/v1/models",
+            );
+            let discount = |raw: &str| {
+                env::set_var("VLLM_PROXY_DISCOUNT_TO_USER", raw);
+                Config::from_env().map(|config| config.discount_to_user)
+            };
+            // Unset, empty and zero all mean list price: nothing to publish
+            // or report.
+            assert_eq!(Config::from_env().unwrap().discount_to_user, None);
+            for none in ["", "  ", "0", "0.0", "0.0000"] {
+                assert_eq!(discount(none).unwrap(), None, "{none:?}");
+            }
+            for (raw, expected) in [
+                ("0.2", 0.2),
+                (" 0.15 ", 0.15),
+                ("0.1500", 0.15),
+                ("0.0001", 0.0001),
+                ("0.1234", 0.1234),
+                ("0.9999", 0.9999),
+            ] {
+                assert_eq!(discount(raw).unwrap(), Some(expected), "{raw:?}");
+            }
+            // Anything else fails startup instead of changing what customers
+            // are shown and charged.
+            for bad in [
+                "1", "1.0", "1.5", "-0.1", "0.12345", "0.99999", "NaN", "inf", "abc", "20%",
+            ] {
+                let err = discount(bad).unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_DISCOUNT_TO_USER"), "{bad}: {err}");
+            }
+            let err = discount("0.12345").unwrap_err().to_string();
+            assert!(err.contains("at most four decimal places"), "{err}");
+            let err = discount("1").unwrap_err().to_string();
+            assert!(err.contains("[0, 1)"), "{err}");
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_internal_models_document_requires_the_usage_token() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            env::set_var("CLOUD_API_URL", "https://cloud-api.test/");
+            env::set_var(
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "https://cloud-api.test/v1/internal/models",
+            );
+            env::remove_var("CLOUD_API_USAGE_TOKEN");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("requires CLOUD_API_USAGE_TOKEN"), "{err}");
+
+            env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret");
+            assert!(Config::from_env().is_ok());
+
+            // The public document needs no token.
+            env::remove_var("CLOUD_API_USAGE_TOKEN");
+            env::set_var(
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "https://cloud-api.test/v1/models",
+            );
+            assert!(Config::from_env().is_ok());
+
+            env::remove_var("CLOUD_API_URL");
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_cloud_api_internal_url_matches_the_whole_origin() {
+        let base = Some("https://cloud-api.test");
+        assert!(is_cloud_api_internal_url(
+            base,
+            "https://cloud-api.test/v1/internal/models"
+        ));
+        assert!(is_cloud_api_internal_url(
+            Some("https://cloud-api.test/"),
+            "https://cloud-api.test/v1/internal/models"
+        ));
+        // Equivalent spellings of the same origin.
+        assert!(is_cloud_api_internal_url(
+            Some("https://cloud-api.test:443"),
+            "https://Cloud-API.test/v1/internal/models"
+        ));
+        // A base URL with a path prefix.
+        assert!(is_cloud_api_internal_url(
+            Some("https://cloud-api.test/api/"),
+            "https://cloud-api.test/api/v1/internal/models"
+        ));
+        for other in [
+            "https://cloud-api.test/v1/models",
+            "https://cloud-api.test.example.org/v1/internal/models",
+            "https://other.test/v1/internal/models",
+            "http://cloud-api.test/v1/internal/models",
+            "https://cloud-api.test:8443/v1/internal/models",
+            "https://cloud-api.test/v1/internal/../models",
+            "not a url",
+        ] {
+            assert!(!is_cloud_api_internal_url(base, other), "{other}");
+        }
+        assert!(!is_cloud_api_internal_url(
+            None,
+            "https://cloud-api.test/v1/internal/models"
+        ));
+    }
+
+    #[test]
+    fn test_discount_to_user_requires_the_models_document() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            // A discount billed on every usage report but never published
+            // (the engine's list is served at list price) fails startup.
+            env::set_var("VLLM_PROXY_DISCOUNT_TO_USER", "0.2");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(
+                err.contains("VLLM_PROXY_DISCOUNT_TO_USER requires VLLM_PROXY_MODELS_DOCUMENT_URL"),
+                "{err}"
+            );
+            env::set_var("VLLM_PROXY_MODELS_DOCUMENT_URL", "  ");
+            assert!(Config::from_env().is_err(), "a blank URL is no URL");
+            env::set_var(
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "https://cloud-api.test/v1/models",
+            );
+            assert_eq!(Config::from_env().unwrap().discount_to_user, Some(0.2));
+            // No discount, nothing to publish: no document needed.
+            env::remove_var("VLLM_PROXY_MODELS_DOCUMENT_URL");
+            env::set_var("VLLM_PROXY_DISCOUNT_TO_USER", "0");
+            assert_eq!(Config::from_env().unwrap().discount_to_user, None);
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_discount_to_user_round_trip_is_exact() {
+        // Every four-decimal value in range is accepted as the f64 the same
+        // literal gives, so the models document and the usage report carry
+        // exactly the number the operator wrote.
+        for basis_points in 1..10_000_u32 {
+            let raw = format!("0.{basis_points:04}");
+            let expected: f64 = raw.parse().unwrap();
+            assert_eq!(
+                parse_discount_to_user(&raw).unwrap(),
+                Some(expected),
+                "{raw}"
+            );
+            // One more decimal place that is not a trailing zero is refused.
+            let finer = format!("{raw}5");
+            assert!(parse_discount_to_user(&finer).is_err(), "{finer}");
+        }
+    }
+
+    #[test]
+    fn test_backend_token_requires_cloud_api_billing() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_TOKEN", "backend-secret"),
+                ("CLOUD_API_URL", "https://cloud-api.test"),
+                ("CLOUD_API_USAGE_TOKEN", ""),
+            ],
+            || {
+                gateway_env_cleanup();
+                env::set_var("VLLM_BACKEND_TOKEN", "backend-secret");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("CLOUD_API_USAGE_TOKEN"), "{err}");
+                env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret");
+                assert!(Config::from_env().is_ok());
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_gateway_listen_addr_and_health_path_are_validated() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("LISTEN_ADDR", "not-an-ip"),
+            ],
+            || {
+                gateway_env_cleanup();
+                env::set_var("LISTEN_ADDR", "not-an-ip");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("LISTEN_ADDR"), "{err}");
+                env::set_var("LISTEN_ADDR", "10.0.0.5");
+                env::set_var("OHTTP_ENABLED", "1");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("OHTTP_ENABLED requires"), "{err}");
+                env::set_var("LISTEN_ADDR", "::1");
+                assert!(
+                    Config::from_env().is_ok(),
+                    "loopback v6 bind is fine with OHTTP"
+                );
+                env::remove_var("OHTTP_ENABLED");
+                env::remove_var("LISTEN_ADDR");
+                env::set_var("VLLM_BACKEND_HEALTH_PATH", "healthz");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_BACKEND_HEALTH_PATH"), "{err}");
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_long_context_tier_settings_are_validated() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            let err = || Config::from_env().unwrap_err().to_string();
+            env::set_var("VLLM_BACKEND_URLS", "https://m-b1.test,https://m-b2.test");
+            // Without the tier nothing changes, repeated probe URLs included
+            // (two proxies in front of one engine is a deployment's business).
+            env::set_var("VLLM_BACKEND_PROBE_URLS", "http://p1:8000,http://p1:8000");
+            assert!(Config::from_env().is_ok());
+            env::remove_var("VLLM_BACKEND_PROBE_URLS");
+            // The tier and its threshold only make sense together.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-long-b3.test");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS"),
+                "{}",
+                err()
+            );
+            env::remove_var("VLLM_BACKEND_LONG_CONTEXT_URLS");
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_URLS"),
+                "{}",
+                err()
+            );
+            // One pool entry serves one tier.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-b2.test");
+            assert!(err().contains("both"), "{}", err());
+
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-long-b3.test/");
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.backend_long_context_urls, ["https://m-long-b3.test"]);
+            assert_eq!(config.long_context_above_tokens, 100_000);
+            assert!(config.pool_probe_urls().is_empty());
+
+            // Probes: one per backend of each tier, in pool order.
+            env::set_var("VLLM_BACKEND_PROBE_URLS", "http://p1:8000,http://p2:8000");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS"),
+                "{}",
+                err()
+            );
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p3:8000");
+            assert_eq!(
+                Config::from_env().unwrap().pool_probe_urls(),
+                ["http://p1:8000", "http://p2:8000", "http://p3:8000"]
+            );
+            // A host serving both tiers has two pool entries but one engine.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p2:8000");
+            assert!(err().contains("both"), "{}", err());
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p3:8000");
+            // Long probes alone would poll a tier nothing else is polled for.
+            env::remove_var("VLLM_BACKEND_PROBE_URLS");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS"),
+                "{}",
+                err()
+            );
+            env::remove_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS");
+
+            // A data-parallel backend is a single engine: no second tier.
+            env::set_var("VLLM_BACKEND_URLS", "https://m-b1.test");
+            env::set_var("VLLM_DATA_PARALLEL_SIZE", "4");
+            assert!(err().contains("VLLM_DATA_PARALLEL_SIZE"), "{}", err());
+            env::remove_var("VLLM_DATA_PARALLEL_SIZE");
+
+            // The agent loop places its own backend requests, which no tier
+            // restriction reaches.
+            env::set_var("WEB_CONTEXT_SEARCH_URL", "https://brave.test");
+            assert!(err().contains("WEB_CONTEXT_SEARCH_URL"), "{}", err());
+            env::remove_var("WEB_CONTEXT_SEARCH_URL");
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_tier_strict_requires_a_long_tier_or_is_ignored() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            // Set without a long tier: not an error, just ignored (a startup
+            // warning is logged, not asserted here).
+            env::set_var("VLLM_BACKEND_TIER_STRICT", "1");
+            assert!(!Config::from_env().unwrap().backend_tier_strict);
+            // With a long tier configured, it takes effect.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-long-b1.test");
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000");
+            assert!(Config::from_env().unwrap().backend_tier_strict);
+            // Unset (the default) leaves today's fallback behavior.
+            env::set_var("VLLM_BACKEND_TIER_STRICT", "0");
+            assert!(!Config::from_env().unwrap().backend_tier_strict);
+            env::remove_var("VLLM_BACKEND_TIER_STRICT");
+            assert!(!Config::from_env().unwrap().backend_tier_strict);
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_tier_strict_is_inert_without_a_long_tier_or_a_zero_threshold() {
+        // `Config::from_env`'s own bail!()s keep "urls empty" and
+        // "above_tokens == 0" in lock step for any config that actually
+        // loads, so this exercises `tier_strict_has_something_to_isolate`
+        // directly: it must not rely on that invariant holding forever, since
+        // `context_tier::decide`'s real off-switch is `above_tokens == 0`.
+        assert!(!tier_strict_has_something_to_isolate(&[], 100_000));
+        assert!(!tier_strict_has_something_to_isolate(
+            &["https://m-long-b1.test".to_string()],
+            0
+        ));
+        assert!(tier_strict_has_something_to_isolate(
+            &["https://m-long-b1.test".to_string()],
+            100_000
+        ));
+    }
+
+    #[test]
+    fn test_config_single_token_backward_compatible() {
+        with_env_vars(&[("MODEL_NAME", "test"), ("TOKEN", "only-one")], || {
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.tokens, vec!["only-one"]);
+        });
+    }
+
+    #[test]
+    fn test_config_default_values() {
+        with_env_vars(&[("MODEL_NAME", "my-model"), ("TOKEN", "secret")], || {
+            // Remove optional vars to test defaults
+            env::remove_var("VLLM_BASE_URL");
+            env::remove_var("VLLM_BACKEND_URLS");
+            env::remove_var("VLLM_DATA_PARALLEL_SIZE");
+            env::remove_var("VLLM_IMAGES_URL");
+            env::remove_var("VLLM_IMAGES_EDITS_URL");
+            env::remove_var("VLLM_TRANSCRIPTIONS_URL");
+            env::remove_var("VLLM_RERANK_URL");
+            env::remove_var("VLLM_SCORE_URL");
+            env::remove_var("DEV");
+            env::remove_var("GPU_NO_HW_MODE");
+            env::remove_var("CHAT_CACHE_EXPIRATION");
+            env::remove_var("VLLM_ALLOWED_MEDIA_DOMAINS");
+            env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS");
+            env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+            env::remove_var("VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS");
+            env::remove_var("WEB_CONTEXT_SEARCH_URL");
+            env::remove_var("WEB_CONTEXT_SEARCH_API_KEY");
+            env::remove_var("BRAVE_LLM_CONTEXT_API_KEY");
+
+            let config = Config::from_env().unwrap();
+
+            assert_eq!(config.model_name, "my-model");
+            assert_eq!(config.tokens, vec!["secret"]);
+            assert_eq!(config.vllm_base_url, "http://localhost:8000");
+            assert_eq!(
+                config.chat_completions_url,
+                "http://localhost:8000/v1/chat/completions"
+            );
+            assert_eq!(
+                config.completions_url,
+                "http://localhost:8000/v1/completions"
+            );
+            assert_eq!(config.tokenize_url, "http://localhost:8000/tokenize");
+            assert_eq!(config.metrics_url, "http://localhost:8000/metrics");
+            assert_eq!(config.models_url, "http://localhost:8000/v1/models");
+            assert_eq!(config.max_request_size, 10 * 1024 * 1024);
+            assert_eq!(config.max_image_request_size, 50 * 1024 * 1024);
+            assert_eq!(config.max_audio_request_size, 100 * 1024 * 1024);
+            assert_eq!(config.chat_cache_expiration_secs, 1200);
+            assert!(!config.dev_mode);
+            assert!(!config.gpu_no_hw_mode);
+            assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
+            assert_eq!(config.vllm_data_parallel_size, None);
+            assert!(config.images_url_override.is_none());
+            assert!(config.rerank_url_override.is_none());
+            assert!(config.image_validation_allowed_domains.is_empty());
+            assert!(!config.image_validation_reject_non_rgb_images);
+            assert!(!config.image_validation_reject_single_channel_images);
+            assert_eq!(config.stream_idle_timeout_secs, 0);
+        });
+    }
+
+    #[test]
+    fn test_stream_idle_timeout_env_override() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "test-model"),
+                ("TOKEN", "tok"),
+                ("VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS", "20"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.stream_idle_timeout_secs, 20);
+            },
+        );
+    }
+
+    #[test]
+    fn test_image_validation_env_vars_override_defaults() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "plain-model"),
+                ("TOKEN", "tok"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_DISABLED", "1"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS", "7"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", "1234"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY", "3"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS", "true"),
+                (
+                    "VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS",
+                    " https://CDN.Example.COM, images.example.com. ",
+                ),
+                ("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "1"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+
+                assert!(!config.image_validation_enabled);
+                assert_eq!(config.image_validation_timeout_secs, 7);
+                assert_eq!(config.image_validation_max_bytes, 1234);
+                assert_eq!(config.image_validation_max_concurrency, 3);
+                assert!(config.image_validation_allow_private_hosts);
+                assert_eq!(
+                    config.image_validation_allowed_domains,
+                    vec!["cdn.example.com", "images.example.com"]
+                );
+                assert!(config.image_validation_reject_non_rgb_images);
+                assert!(config.image_validation_reject_single_channel_images);
+
+                let image_validation = config.image_validation();
+                assert!(!image_validation.enabled);
+                assert_eq!(image_validation.timeout, std::time::Duration::from_secs(7));
+                assert_eq!(image_validation.max_bytes, 1234);
+                assert_eq!(image_validation.max_concurrency, 3);
+                assert!(image_validation.allow_private_hosts);
+                assert_eq!(
+                    image_validation.allowed_domains,
+                    vec!["cdn.example.com", "images.example.com"]
+                );
+                assert!(image_validation.reject_non_rgb_images);
+                assert!(image_validation.reject_single_channel_images);
+            },
+        );
+    }
+
+    #[test]
+    fn test_image_validation_allowed_domains_fallback_and_gemma_default() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "plain-model"),
+                ("TOKEN", "tok"),
+                (
+                    "VLLM_ALLOWED_MEDIA_DOMAINS",
+                    "prod-files-secure.s3.us-west-2.amazonaws.com, CDN.GeneralContext.COM",
+                ),
+            ],
+            || {
+                env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS");
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.image_validation_allowed_domains,
+                    vec![
+                        "prod-files-secure.s3.us-west-2.amazonaws.com",
+                        "cdn.generalcontext.com"
+                    ]
+                );
+            },
+        );
+
+        with_env_vars(
+            &[("MODEL_NAME", "google/gemma-4-31B-it"), ("TOKEN", "tok")],
+            || {
+                env::remove_var("VLLM_ALLOWED_MEDIA_DOMAINS");
+                env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS");
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.image_validation_allowed_domains,
+                    vec![DEFAULT_GEMMA4_ALLOWED_MEDIA_DOMAIN]
+                );
+            },
+        );
+
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "google/gemma-4-31B-it"),
+                ("TOKEN", "tok"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS", ""),
+                (
+                    "VLLM_ALLOWED_MEDIA_DOMAINS",
+                    "prod-files-secure.s3.us-west-2.amazonaws.com",
+                ),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.image_validation_allowed_domains.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_accepts_brave_llm_context_api_key_alias() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("WEB_CONTEXT_SEARCH_URL", "https://brave.test/context"),
+                ("WEB_CONTEXT_SEARCH_API_KEY", ""),
+                ("BRAVE_LLM_CONTEXT_API_KEY", "brave-alias-key"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.web_context_search_api_key.as_deref(),
+                    Some("brave-alias-key")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_gemma4_enables_single_channel_guard_by_default_with_env_override() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "RedHatAI/gemma-4-31B-it-FP8-Dynamic"),
+                ("TOKEN", "tok"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "0"),
+            ],
+            || {
+                env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+                let config = Config::from_env().unwrap();
+                assert!(config.image_validation_reject_single_channel_images);
+                assert!(!config.image_validation_reject_non_rgb_images);
+
+                env::set_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "1");
+                let config = Config::from_env().unwrap();
+                assert!(config.image_validation_reject_single_channel_images);
+                assert!(config.image_validation_reject_non_rgb_images);
+
+                env::set_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "0");
+                let config = Config::from_env().unwrap();
+                assert!(!config.image_validation_reject_single_channel_images);
+                assert!(!config.image_validation_reject_non_rgb_images);
+            },
+        );
+    }
+
+    #[test]
+    fn test_gemma4_guard_does_not_match_gemma_4b() {
+        with_env_vars(
+            &[("MODEL_NAME", "google/gemma-4b-it"), ("TOKEN", "tok")],
+            || {
+                env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+
+                let config = Config::from_env().unwrap();
+
+                assert!(!config.image_validation_reject_single_channel_images);
+                assert!(!config.image_validation_reject_non_rgb_images);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_backend_urls() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                (
+                    "VLLM_BACKEND_URLS",
+                    "http://b1:8000, http://b2:8000 , http://b3:8000/",
+                ),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.backend_urls,
+                    vec!["http://b1:8000", "http://b2:8000", "http://b3:8000"]
+                );
+                // vllm_base_url should still be set for backward compat
+                assert!(!config.vllm_base_url.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_backend_urls_fallback_to_base() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_BASE_URL", "http://myhost:9000"),
+            ],
+            || {
+                env::remove_var("VLLM_BACKEND_URLS");
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.backend_urls, vec!["http://myhost:9000"]);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_parses_vllm_data_parallel_size() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_DATA_PARALLEL_SIZE", "4"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.vllm_data_parallel_size, Some(4));
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_invalid_vllm_data_parallel_size() {
+        for invalid in ["0", "not-a-number", ""] {
+            with_env_vars(
+                &[
+                    ("MODEL_NAME", "model"),
+                    ("TOKEN", "tok"),
+                    ("VLLM_DATA_PARALLEL_SIZE", invalid),
+                ],
+                || {
+                    let error = Config::from_env().unwrap_err().to_string();
+                    assert!(error.contains("VLLM_DATA_PARALLEL_SIZE"));
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_rejects_dp_affinity_with_multiple_backends() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_DATA_PARALLEL_SIZE", "4"),
+                ("VLLM_BACKEND_URLS", "http://backend-a,http://backend-b"),
+            ],
+            || {
+                let error = Config::from_env().unwrap_err().to_string();
+                assert!(error.contains("requires exactly one vLLM backend"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_backend_conversation_affinity_defaults_off() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_BACKEND_URLS", "http://backend-a,http://backend-b"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(!config.backend_conversation_affinity);
+                assert_eq!(config.backend_affinity_max_imbalance, 8);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_parses_backend_conversation_affinity() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_BACKEND_URLS", "http://backend-a,http://backend-b"),
+                ("VLLM_BACKEND_CONVERSATION_AFFINITY", "true"),
+                ("VLLM_BACKEND_AFFINITY_MAX_IMBALANCE", "3"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.backend_conversation_affinity);
+                assert_eq!(config.backend_affinity_max_imbalance, 3);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_backend_affinity_combined_with_dp_affinity() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_DATA_PARALLEL_SIZE", "4"),
+                ("VLLM_BACKEND_CONVERSATION_AFFINITY", "1"),
+            ],
+            || {
+                let error = Config::from_env().unwrap_err().to_string();
+                assert!(error.contains("mutually exclusive"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_url_overrides_tracked() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                (
+                    "VLLM_IMAGES_URL",
+                    "http://image-service/v1/images/generations",
+                ),
+                ("VLLM_RERANK_URL", "http://rerank-service/v1/rerank"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.images_url_override.as_deref(),
+                    Some("http://image-service/v1/images/generations")
+                );
+                assert_eq!(
+                    config.rerank_url_override.as_deref(),
+                    Some("http://rerank-service/v1/rerank")
+                );
+                assert!(config.score_url_override.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_custom_base_url() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_BASE_URL", "http://gpu-server:9000"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.chat_completions_url,
+                    "http://gpu-server:9000/v1/chat/completions"
+                );
+                assert_eq!(config.metrics_url, "http://gpu-server:9000/metrics");
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_url_overrides() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                (
+                    "VLLM_IMAGES_URL",
+                    "http://image-service/v1/images/generations",
+                ),
+                ("VLLM_RERANK_URL", "http://rerank-service/v1/rerank"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.images_url,
+                    "http://image-service/v1/images/generations"
+                );
+                assert_eq!(config.rerank_url, "http://rerank-service/v1/rerank");
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_dev_mode_flags() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("DEV", "1"),
+                ("GPU_NO_HW_MODE", "true"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.dev_mode);
+                assert!(config.gpu_no_hw_mode);
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_bool_variants() {
+        for val in &["1", "true", "yes", "True", "YES"] {
+            with_env_vars(&[("_TEST_BOOL", val)], || {
+                assert!(env_bool("_TEST_BOOL"), "Expected true for '{val}'");
+            });
+        }
+        for val in &["0", "false", "no", "anything"] {
+            with_env_vars(&[("_TEST_BOOL", val)], || {
+                assert!(!env_bool("_TEST_BOOL"), "Expected false for '{val}'");
+            });
+        }
+    }
+
+    #[test]
+    fn test_env_int_fallback() {
+        env::remove_var("_TEST_INT_NONEXISTENT");
+        assert_eq!(env_int("_TEST_INT_NONEXISTENT", 42), 42);
+
+        with_env_vars(&[("_TEST_INT_INVALID", "not_a_number")], || {
+            assert_eq!(env_int("_TEST_INT_INVALID", 42), 42);
+        });
+
+        with_env_vars(&[("_TEST_INT_VALID", "99")], || {
+            assert_eq!(env_int("_TEST_INT_VALID", 42), 99);
+        });
+    }
+
+    #[test]
+    fn borrowing_config_requires_admission_and_a_bounded_long_tier() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_PROXY_ADMISSION_TIER_BORROWING", "1"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+                ("VLLM_PROXY_ADMISSION_START_INFLIGHT", "48"),
+                ("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "12"),
+                ("VLLM_BACKEND_URLS", "http://base"),
+                ("VLLM_BACKEND_LONG_CONTEXT_URLS", "http://long"),
+                ("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000"),
+            ],
+            || {
+                let c = Config::from_env().unwrap();
+                assert!(c.admission().unwrap().tier_borrowing);
+                assert_eq!(c.admission_long_max_inflight_per_host, 12);
+                assert_eq!(c.admission().unwrap().long_reserved_inflight, 0);
+                env::set_var("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT", "12");
+                assert_eq!(
+                    Config::from_env()
+                        .unwrap()
+                        .admission()
+                        .unwrap()
+                        .long_reserved_inflight,
+                    12
+                );
+                // The base tier must keep at least one slot at the starting budget.
+                env::set_var("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT", "48");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("LONG_RESERVED_INFLIGHT"));
+                // A reserve needs the two tiers that borrowing configures.
+                env::set_var("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT", "12");
+                env::remove_var("VLLM_PROXY_ADMISSION_TIER_BORROWING");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("LONG_RESERVED_INFLIGHT"));
+                env::set_var("VLLM_PROXY_ADMISSION_TIER_BORROWING", "1");
+                env::remove_var("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT");
+                env::set_var("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "0");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("TIER_BORROWING"));
+                env::set_var("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "12");
+                env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "0");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("TIER_BORROWING"));
+                env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48");
+                env::remove_var("VLLM_BACKEND_LONG_CONTEXT_URLS");
+                env::remove_var("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("TIER_BORROWING"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_backend_max_inflight_parses_and_refuses_admission() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            assert_eq!(Config::from_env().unwrap().backend_max_inflight, None);
+        });
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_MAX_INFLIGHT", "0"),
+            ],
+            || assert_eq!(Config::from_env().unwrap().backend_max_inflight, None),
+        );
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_MAX_INFLIGHT", "96"),
+            ],
+            || assert_eq!(Config::from_env().unwrap().backend_max_inflight, Some(96)),
+        );
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_MAX_INFLIGHT", "96"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+            ],
+            || {
+                let error = Config::from_env().unwrap_err().to_string();
+                assert!(error.contains("VLLM_BACKEND_MAX_INFLIGHT"), "{error}");
+            },
+        );
+        // A gateway in list mode bounds backends per model: refused too.
+        with_env_vars(
+            &[
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_MAX_INFLIGHT", "96"),
+                (
+                    crate::model_list::MODEL_LIST_FILE_ENV,
+                    "/nonexistent/models.json",
+                ),
+            ],
+            || {
+                let error = Config::from_env().unwrap_err().to_string();
+                assert!(error.contains("VLLM_BACKEND_MAX_INFLIGHT"), "{error}");
+            },
+        );
+    }
+
+    #[test]
+    fn test_admission_config_parses_and_validates() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+                ("VLLM_PROXY_ADMISSION_START_INFLIGHT", "32"),
+                ("VLLM_PROXY_ADMISSION_RAMP_STEP", "8"),
+                ("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", "1800"),
+                ("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "30000"),
+                ("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", "10"),
+                ("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", "4"),
+                ("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2"),
+                ("VLLM_BACKEND_CONNECT_FAILOVER", "1"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.admission(),
+                    Some(crate::admission::AdmissionConfig {
+                        max_inflight: 48,
+                        tier_borrowing: false,
+                        long_max_inflight_per_host: 0,
+                        long_reserved_inflight: 0,
+                        start_inflight: 32,
+                        ramp_step: 8,
+                        ramp_interval: std::time::Duration::from_secs(1800),
+                        ttft_p95_max: Some(std::time::Duration::from_secs(30)),
+                        backpressure_ttl: std::time::Duration::from_secs(10),
+                        queue_saturated_at: 4,
+                        retry_after: std::time::Duration::from_secs(2),
+                    })
+                );
+                assert!(config.backend_connect_failover);
+
+                // No TTFT check when the bound is 0; no ramp when start is omitted;
+                // unset queue threshold falls back to 1 (today's behaviour).
+                env::set_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "0");
+                env::remove_var("VLLM_PROXY_ADMISSION_START_INFLIGHT");
+                env::remove_var("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT");
+                let config = Config::from_env().unwrap();
+                let admission = config.admission().unwrap();
+                assert_eq!(admission.ttft_p95_max, None);
+                assert_eq!(admission.start_inflight, 48);
+                assert_eq!(admission.queue_saturated_at, 1);
+
+                // Validation.
+                env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "64");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_ADMISSION_START_INFLIGHT"), "{err}");
+                env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "32");
+                env::set_var("VLLM_PROXY_ADMISSION_RAMP_STEP", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_ADMISSION_RAMP_STEP"), "{err}");
+                env::set_var("VLLM_PROXY_ADMISSION_RAMP_STEP", "8");
+                env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "lots");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_ADMISSION_MAX_INFLIGHT"), "{err}");
+                env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48");
+                env::set_var("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS"),
+                    "{err}"
+                );
+                env::remove_var("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS");
+                env::set_var("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT"),
+                    "{err}"
+                );
+                env::remove_var("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT");
+                env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS"),
+                    "{err}"
+                );
+                env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2");
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.admission_max_inflight, 48);
+                // Web context search runs outside the lane budget.
+                env::set_var("WEB_CONTEXT_SEARCH_URL", "https://search.example");
+                env::set_var("WEB_CONTEXT_SEARCH_API_KEY", "search-secret");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("WEB_CONTEXT_SEARCH_URL"), "{err}");
+                env::remove_var("WEB_CONTEXT_SEARCH_URL");
+                env::remove_var("WEB_CONTEXT_SEARCH_API_KEY");
+                // Probe URLs pair with the backend URLs one to one.
+                env::set_var("VLLM_BACKEND_URLS", "https://a.example,https://b.example");
+                env::set_var("VLLM_BACKEND_PROBE_URLS", "http://10.0.0.1:8000/");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_BACKEND_PROBE_URLS"), "{err}");
+                env::set_var(
+                    "VLLM_BACKEND_PROBE_URLS",
+                    "http://10.0.0.1:8000/, http://10.0.0.2:8000",
+                );
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.backend_probe_urls,
+                    vec!["http://10.0.0.1:8000", "http://10.0.0.2:8000"]
+                );
+                env::remove_var("VLLM_BACKEND_PROBE_URLS");
+                env::remove_var("VLLM_BACKEND_URLS");
+                env::remove_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS");
+            },
+        );
+    }
+
+    /// `with_env_vars` from a clean set of gateway variables, with `vars` on
+    /// top and none of them left behind.
+    fn with_clean_env<R>(
+        restored: &[(&str, &str)],
+        vars: &[(&str, &str)],
+        f: impl FnOnce() -> R,
+    ) -> R {
+        with_env_vars(restored, || {
+            gateway_env_cleanup();
+            for (key, value) in vars {
+                env::set_var(key, value);
+            }
+            let result = f();
+            for (key, _) in vars {
+                env::remove_var(key);
+            }
+            result
+        })
+    }
+
+    /// What list mode needs besides the list.
+    const LIST_MODE_ENV: [(&str, &str); 2] = [
+        ("NON_TEE_DEPLOYMENT", "1"),
+        (
+            "VLLM_PROXY_MODELS_DOCUMENT_URL",
+            "https://catalog.example/v1/models",
+        ),
+    ];
+
+    /// Run `f` in gateway list mode: `list` in a file named by
+    /// `VLLM_PROXY_MODEL_LIST_FILE`, `LIST_MODE_ENV`, and `vars` on top (an
+    /// empty value takes one of those away again).
+    fn with_model_list<R>(
+        list: &serde_json::Value,
+        vars: &[(&str, &str)],
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), list.to_string()).unwrap();
+        let path = file.path().to_str().unwrap();
+        let vars: Vec<_> = LIST_MODE_ENV.iter().chain(vars).copied().collect();
+        with_clean_env(
+            &[
+                ("MODEL_NAME", ""),
+                ("TOKEN", "t"),
+                (crate::model_list::MODEL_LIST_FILE_ENV, path),
+            ],
+            &vars,
+            f,
+        )
+    }
+
+    fn two_models() -> serde_json::Value {
+        serde_json::json!({"models": [
+            {"id": "example/alpha", "backend_urls": ["https://alpha-b1.example"]},
+            {"id": "example/beta", "backend_urls": ["https://beta-b1.example"]}
+        ]})
+    }
+
+    #[test]
+    fn test_model_list_file_switches_list_mode_on() {
+        // Without the variable there is no list: one model, from MODEL_NAME.
+        with_clean_env(&[("MODEL_NAME", "m"), ("TOKEN", "t")], &[], || {
+            let config = Config::from_env().unwrap();
+            assert!(config.model_list.is_none());
+            assert_eq!(config.model_name, "m");
+        });
+        // An empty value is not a path either.
+        with_clean_env(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                (crate::model_list::MODEL_LIST_FILE_ENV, " "),
+            ],
+            &[],
+            || assert!(Config::from_env().unwrap().model_list.is_none()),
+        );
+
+        with_model_list(
+            &two_models(),
+            &[
+                ("CLOUD_API_URL", "https://cloud-api.example"),
+                ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+                // Defaults for the entries, not a model of the process's own.
+                ("VLLM_BACKEND_TOKEN", "shared-secret"),
+                ("VLLM_BACKEND_PRIORITY", "-1"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+                ("VLLM_PROXY_DISCOUNT_TO_USER", "0.2"),
+                ("VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE", "150"),
+                ("VLLM_PROXY_REASONING_OFF_EFFORT", "low"),
+                // Tier defaults without a tier anywhere: fine in list mode.
+                ("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000"),
+                ("VLLM_BACKEND_TIER_STRICT", "1"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                let list = config.model_list.as_ref().expect("list mode");
+                assert!(list.path.ends_with(
+                    env::var(crate::model_list::MODEL_LIST_FILE_ENV)
+                        .unwrap()
+                        .as_str()
+                ));
+                let ids: Vec<_> = list.models.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(ids, ["example/alpha", "example/beta"]);
+                for model in &list.models {
+                    assert_eq!(model.backend_token.as_deref(), Some("shared-secret"));
+                    assert_eq!(model.backend_priority, Some(-1));
+                    assert_eq!(model.admission_max_inflight, 48);
+                    assert_eq!(model.admission_start_inflight, 48);
+                    assert_eq!(model.discount_to_user, Some(0.2));
+                    assert_eq!(model.capacity_requests_per_minute, 150);
+                    assert_eq!(model.reasoning_off_effort, "low");
+                    assert_eq!(model.long_context_above_tokens, 0);
+                    assert!(!model.backend_tier_strict);
+                    assert!(config.admission_for(model).is_some());
+                }
+
+                // The process itself is no model: nothing to route to, no
+                // bearer, no budget, nothing to bill as.
+                assert_eq!(config.model_name, "");
+                assert_eq!(
+                    config.backend_urls,
+                    [crate::model_list::UNROUTED_BACKEND_URL]
+                );
+                assert!(config
+                    .chat_completions_url
+                    .starts_with(crate::model_list::UNROUTED_BACKEND_URL));
+                assert!(config.backend_token.is_none());
+                assert!(config.backend_priority.is_none());
+                assert!(config.admission().is_none());
+                assert!(config.discount_to_user.is_none());
+                assert_eq!(config.capacity_requests_per_minute, 0);
+                assert_eq!(config.reasoning_off_effort, "none");
+                assert_eq!(config.long_context_above_tokens, 0);
+                assert!(!config.backend_tier_strict);
+                assert!(config.pool_probe_urls().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn test_a_list_of_one_model_is_the_single_model_configuration() {
+        let hosts = [
+            (
+                "VLLM_BACKEND_URLS",
+                "https://alpha-b1.example,https://alpha-b2.example/",
+            ),
+            (
+                "VLLM_BACKEND_PROBE_URLS",
+                "http://alpha-1.example:8000,http://alpha-2.example:8000",
+            ),
+            (
+                "VLLM_BACKEND_LONG_CONTEXT_URLS",
+                "https://alpha-long-b3.example",
+            ),
+            (
+                "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
+                "http://alpha-3.example:8000",
+            ),
+        ];
+        let per_model = [
+            ("VLLM_BACKEND_PRIORITY", "-1"),
+            ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+            ("VLLM_PROXY_ADMISSION_START_INFLIGHT", "32"),
+            ("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", "4"),
+            ("VLLM_PROXY_ADMISSION_TIER_BORROWING", "1"),
+            ("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "12"),
+            ("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT", "8"),
+            ("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000"),
+            ("VLLM_BACKEND_TIER_STRICT", "1"),
+            ("VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE", "150"),
+            ("VLLM_PROXY_DISCOUNT_TO_USER", "0.3"),
+            ("VLLM_PROXY_REASONING_OFF_EFFORT", "low"),
+        ];
+        // Process-level in both modes.
+        let shared = [
+            ("CLOUD_API_URL", "https://cloud-api.example"),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_PROXY_ADMISSION_RAMP_STEP", "4"),
+            ("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", "600"),
+            ("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "20000"),
+            ("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", "5"),
+            ("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "3"),
+        ];
+        let effective = |config: &Config, model: crate::model_list::ModelConfig| {
+            let admission = config.admission_for(&model);
+            (model, admission)
+        };
+
+        // One model from the environment, as every gateway runs today.
+        let single_env: Vec<_> = LIST_MODE_ENV
+            .iter()
+            .chain(&shared)
+            .chain(&hosts)
+            .chain(&per_model)
+            .chain(&[("VLLM_BACKEND_TOKEN", "backend-secret")])
+            .copied()
+            .collect();
+        let single = with_clean_env(
+            &[("MODEL_NAME", "example/alpha"), ("TOKEN", "t")],
+            &single_env,
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.model_list.is_none());
+                assert_eq!(
+                    config.admission(),
+                    config.admission_for(&config.single_model())
+                );
+                effective(&config, config.single_model())
+            },
+        );
+        assert_eq!(single.0.id, "example/alpha");
+        assert_eq!(single.0.backend_urls.len(), 2);
+        assert!(single.0.backend_tier_strict);
+        assert_eq!(single.1.as_ref().unwrap().start_inflight, 32);
+
+        // The same model written out in full, none of its variables set.
+        let written_out = serde_json::json!({"models": [{
+            "id": "example/alpha",
+            "backend_urls": ["https://alpha-b1.example", "https://alpha-b2.example/"],
+            "backend_probe_urls": ["http://alpha-1.example:8000", "http://alpha-2.example:8000"],
+            "long_context": {
+                "backend_urls": ["https://alpha-long-b3.example"],
+                "backend_probe_urls": ["http://alpha-3.example:8000"],
+                "above_tokens": 100000,
+                "strict": true,
+                "borrowing": true,
+                "max_inflight_per_host": 12,
+                "reserved_inflight": 8
+            },
+            "admission_max_inflight": 48,
+            "admission_start_inflight": 32,
+            "admission_queue_saturated_at": 4,
+            "capacity_requests_per_minute": 150,
+            "discount_to_user": 0.3,
+            "reasoning_off_effort": "low",
+            "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
+            "backend_priority": -1
+        }]});
+        let full_env: Vec<_> = shared
+            .iter()
+            .chain(&[("VLLM_BACKEND_TOKEN_ALPHA", "backend-secret")])
+            .copied()
+            .collect();
+        let full = with_model_list(&written_out, &full_env, || {
+            let config = Config::from_env().unwrap();
+            let model = config.model_list.as_ref().unwrap().models[0].clone();
+            effective(&config, model)
+        });
+        assert_eq!(single, full);
+
+        // And as `id` plus its hosts, everything else left to the variables.
+        let hosts_only = serde_json::json!({"models": [{
+            "id": "example/alpha",
+            "backend_urls": ["https://alpha-b1.example", "https://alpha-b2.example/"],
+            "backend_probe_urls": ["http://alpha-1.example:8000", "http://alpha-2.example:8000"],
+            "long_context": {
+                "backend_urls": ["https://alpha-long-b3.example"],
+                "backend_probe_urls": ["http://alpha-3.example:8000"]
+            }
+        }]});
+        let defaulted_env: Vec<_> = shared
+            .iter()
+            .chain(&per_model)
+            .chain(&[("VLLM_BACKEND_TOKEN", "backend-secret")])
+            .copied()
+            .collect();
+        let defaulted = with_model_list(&hosts_only, &defaulted_env, || {
+            let config = Config::from_env().unwrap();
+            let model = config.model_list.as_ref().unwrap().models[0].clone();
+            effective(&config, model)
+        });
+        assert_eq!(single, defaulted);
+    }
+
+    #[test]
+    fn test_list_mode_refuses_what_assumes_one_model() {
+        let list = two_models();
+        let error_with = |vars: &[(&str, &str)]| {
+            with_model_list(&list, vars, || {
+                Config::from_env()
+                    .expect_err("list mode must refuse this")
+                    .to_string()
+            })
+        };
+        // The variables that name the single model and its backends.
+        for (name, value) in [
+            ("MODEL_NAME", "example/alpha"),
+            ("VLLM_BACKEND_URLS", "https://alpha-b1.example"),
+            ("VLLM_BACKEND_PROBE_URLS", "http://alpha-1.example:8000"),
+            (
+                "VLLM_BACKEND_LONG_CONTEXT_URLS",
+                "https://alpha-long.example",
+            ),
+            (
+                "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
+                "http://alpha-2.example:8000",
+            ),
+        ] {
+            let error = error_with(&[(name, value)]);
+            assert!(
+                error.contains(name) && error.contains("VLLM_PROXY_MODEL_LIST_FILE"),
+                "{name}: {error}"
+            );
+        }
+        // What list mode cannot do without.
+        for name in ["NON_TEE_DEPLOYMENT", "VLLM_PROXY_MODELS_DOCUMENT_URL"] {
+            let error = error_with(&[(name, "")]);
+            assert!(
+                error.contains(&format!("VLLM_PROXY_MODEL_LIST_FILE requires {name}")),
+                "{error}"
+            );
+        }
+        // Features built around one model, each otherwise fully configured.
+        let features: [(&str, &[(&str, &str)]); 5] = [
+            (
+                "WEB_CONTEXT_SEARCH_URL",
+                &[
+                    ("WEB_CONTEXT_SEARCH_URL", "https://search.example"),
+                    ("WEB_CONTEXT_SEARCH_API_KEY", "search-secret"),
+                ],
+            ),
+            ("OHTTP_ENABLED", &[("OHTTP_ENABLED", "1")]),
+            (
+                "VLLM_DATA_PARALLEL_SIZE",
+                &[("VLLM_DATA_PARALLEL_SIZE", "2")],
+            ),
+            (
+                "OPENAI_CHAT_COMPATIBILITY_CHECK",
+                &[("OPENAI_CHAT_COMPATIBILITY_CHECK", "true")],
+            ),
+            (
+                "REPLICA_STATE_REDIS_URL",
+                &[
+                    ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
+                    ("REPLICA_STATE_HOST_ID", "host01"),
+                ],
+            ),
+        ];
+        for (name, vars) in features {
+            let error = error_with(vars);
+            assert!(
+                error.contains(&format!(
+                    "VLLM_PROXY_MODEL_LIST_FILE cannot be combined with {name}"
+                )),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_model_list_file_problems_fail_startup() {
+        let error_of = |list: &serde_json::Value, vars: &[(&str, &str)]| {
+            with_model_list(list, vars, || {
+                Config::from_env()
+                    .expect_err("the list must be refused")
+                    .to_string()
+            })
+        };
+        // Every failure names the variable and the file.
+        let error = error_of(&serde_json::json!({"models": []}), &[]);
+        assert!(
+            error.starts_with("VLLM_PROXY_MODEL_LIST_FILE (")
+                && error.contains("`models` is empty"),
+            "{error}"
+        );
+        let error = error_of(&serde_json::json!("not a list"), &[]);
+        assert!(error.contains("not a valid model list"), "{error}");
+
+        // A token variable the list names has to be set in the environment,
+        // and a model that holds a token needs a process that can bill.
+        let with_token = serde_json::json!({"models": [{
+            "id": "example/alpha",
+            "backend_urls": ["https://alpha-b1.example"],
+            "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA"
+        }]});
+        let billing = [
+            ("CLOUD_API_URL", "https://cloud-api.example"),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ];
+        let error = error_of(&with_token, &billing);
+        assert!(
+            error.contains("model \"example/alpha\"")
+                && error.contains("VLLM_BACKEND_TOKEN_ALPHA, which is not set"),
+            "{error}"
+        );
+        let error = error_of(&with_token, &[("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret")]);
+        assert!(error.contains("requires billing"), "{error}");
+        assert!(!error.contains("alpha-secret"), "{error}");
+        let token_env: Vec<_> = billing
+            .iter()
+            .chain(&[("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret")])
+            .copied()
+            .collect();
+        with_model_list(&with_token, &token_env, || {
+            let config = Config::from_env().unwrap();
+            let model = &config.model_list.as_ref().unwrap().models[0];
+            assert_eq!(model.backend_token.as_deref(), Some("alpha-secret"));
+            assert!(!format!("{:?}", config.model_list).contains("alpha-secret"));
+        });
+
+        // A file that is not there.
+        with_clean_env(
+            &[
+                ("MODEL_NAME", ""),
+                ("TOKEN", "t"),
+                (
+                    crate::model_list::MODEL_LIST_FILE_ENV,
+                    "/nonexistent/model-list.json",
+                ),
+            ],
+            &LIST_MODE_ENV,
+            || {
+                let error = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    error.contains(
+                        "VLLM_PROXY_MODEL_LIST_FILE: cannot read /nonexistent/model-list.json"
+                    ),
+                    "{error}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_reasoning_effort_map_is_a_list_key_checked_at_startup() {
+        let lane = [
+            ("CLOUD_API_URL", "https://cloud-api.example"),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret"),
+        ];
+        let list = |alpha: serde_json::Value| {
+            let mut alpha = alpha;
+            alpha["id"] = serde_json::json!("example/alpha");
+            alpha["backend_urls"] = serde_json::json!(["https://alpha-b1.example"]);
+            serde_json::json!({"models": [
+                alpha,
+                {"id": "example/beta", "backend_urls": ["https://beta-b1.example"]}
+            ]})
+        };
+        let mapped = |map: serde_json::Value| {
+            list(serde_json::json!({
+                "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
+                "reasoning_effort_map": map
+            }))
+        };
+
+        // One model's map, and nothing for the model next to it.
+        with_model_list(&mapped(serde_json::json!({"high": "xhigh"})), &lane, || {
+            let config = Config::from_env().unwrap();
+            let models = &config.model_list.as_ref().unwrap().models;
+            assert_eq!(models[0].reasoning_effort_map.get("high"), Some("xhigh"));
+            assert!(models[1].reasoning_effort_map.is_empty());
+            // The process itself is no model and has no map.
+            assert!(config.single_model().reasoning_effort_map.is_empty());
+        });
+
+        // What cannot be served as written fails startup, naming the file
+        // and the model.
+        let low_is_off: Vec<_> = lane
+            .iter()
+            .chain(&[("VLLM_PROXY_REASONING_OFF_EFFORT", "low")])
+            .copied()
+            .collect();
+        for (list, vars, expected) in [
+            (
+                mapped(serde_json::json!({"high": "xhigh", "xhigh": "max"})),
+                &lane[..],
+                "\"high\" becomes \"xhigh\", which is itself a key",
+            ),
+            (
+                mapped(serde_json::json!({"high": ""})),
+                &lane[..],
+                "every key and value must be 1 to 32 characters",
+            ),
+            (
+                mapped(serde_json::json!({"": "xhigh"})),
+                &lane[..],
+                "every key and value must be 1 to 32 characters",
+            ),
+            (
+                mapped(serde_json::json!({"minimal": "low"})),
+                &lane[..],
+                "\"minimal\" cannot be a key",
+            ),
+            // Against the process-level off effort the entry falls back to.
+            (
+                mapped(serde_json::json!({"low": "medium"})),
+                &low_is_off[..],
+                "\"low\" cannot be a key: it is this model's `reasoning_off_effort`",
+            ),
+            (
+                mapped(serde_json::json!({"high": "none"})),
+                &low_is_off[..],
+                "\"high\" cannot become \"none\"",
+            ),
+            (
+                list(serde_json::json!({"reasoning_effort_map": {"high": "xhigh"}})),
+                &lane[..],
+                "`reasoning_effort_map` requires a backend token",
+            ),
+        ] {
+            let error = with_model_list(&list, vars, || {
+                Config::from_env()
+                    .expect_err("the list must be refused")
+                    .to_string()
+            });
+            assert!(
+                error.starts_with("VLLM_PROXY_MODEL_LIST_FILE (")
+                    && error.contains("model \"example/alpha\"")
+                    && error.contains(expected),
+                "{list}: {error}"
+            );
+        }
+
+        // A process without a list has no map, and there is no variable that
+        // gives it one: the key is not a process-level setting.
+        with_clean_env(
+            &[("MODEL_NAME", "example/alpha"), ("TOKEN", "t")],
+            &[
+                ("NON_TEE_DEPLOYMENT", "1"),
+                ("VLLM_BACKEND_URLS", "https://alpha-b1.example"),
+                ("VLLM_BACKEND_TOKEN", "backend-secret"),
+                ("CLOUD_API_URL", "https://cloud-api.example"),
+                ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+                ("VLLM_PROXY_REASONING_EFFORT_MAP", "{\"high\":\"xhigh\"}"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.model_list.is_none());
+                assert!(config.single_model().reasoning_effort_map.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn test_merge_system_messages_is_a_list_key_checked_at_startup() {
+        let list = |value: serde_json::Value| {
+            serde_json::json!({"models": [
+                {
+                    "id": "example/alpha",
+                    "backend_urls": ["https://alpha-b1.example"],
+                    "merge_system_messages": value
+                },
+                {"id": "example/beta", "backend_urls": ["https://beta-b1.example"]}
+            ]})
+        };
+
+        // One model's setting, and nothing for the model next to it. It needs
+        // nothing else: no backend token, no other variable.
+        with_model_list(&list(serde_json::json!(true)), &[], || {
+            let config = Config::from_env().unwrap();
+            let models = &config.model_list.as_ref().unwrap().models;
+            assert!(models[0].merge_system_messages);
+            assert!(!models[1].merge_system_messages);
+            // The process itself is no model and merges nothing.
+            assert!(!config.single_model().merge_system_messages);
+        });
+        with_model_list(&list(serde_json::json!(false)), &[], || {
+            let config = Config::from_env().unwrap();
+            assert!(!config.model_list.as_ref().unwrap().models[0].merge_system_messages);
+        });
+
+        // Anything but `true` or `false` fails startup, naming the file.
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            let error = with_model_list(&list(value.clone()), &[], || {
+                Config::from_env()
+                    .expect_err("the list must be refused")
+                    .to_string()
+            });
+            assert!(
+                error.starts_with("VLLM_PROXY_MODEL_LIST_FILE (")
+                    && error.contains("not a valid model list")
+                    && error.contains("expected a boolean"),
+                "{value}: {error}"
+            );
+        }
+
+        // A process without a list merges nothing, and there is no variable
+        // that makes it: the key is not a process-level setting.
+        with_clean_env(
+            &[("MODEL_NAME", "example/alpha"), ("TOKEN", "t")],
+            &[
+                ("NON_TEE_DEPLOYMENT", "1"),
+                ("VLLM_BACKEND_URLS", "https://alpha-b1.example"),
+                ("VLLM_PROXY_MERGE_SYSTEM_MESSAGES", "1"),
+                ("MERGE_SYSTEM_MESSAGES", "true"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.model_list.is_none());
+                assert!(!config.single_model().merge_system_messages);
+            },
+        );
+    }
+
+    #[test]
+    fn test_affinity_hold_at_limit_env_and_list_key() {
+        let list = |entry: serde_json::Value| {
+            let mut alpha = serde_json::json!({
+                "id": "example/alpha",
+                "backend_urls": ["https://alpha-b1.example"]
+            });
+            alpha
+                .as_object_mut()
+                .unwrap()
+                .extend(entry.as_object().unwrap().clone());
+            serde_json::json!({"models": [
+                alpha,
+                {"id": "example/beta", "backend_urls": ["https://beta-b1.example"]}
+            ]})
+        };
+        let hold = |config: &Config| {
+            config
+                .model_list
+                .as_ref()
+                .unwrap()
+                .models
+                .iter()
+                .map(|model| model.affinity_hold_at_limit)
+                .collect::<Vec<_>>()
+        };
+
+        // Off by default, in both modes.
+        with_model_list(&list(serde_json::json!({})), &[], || {
+            let config = Config::from_env().unwrap();
+            assert!(!config.affinity_hold_at_limit);
+            assert_eq!(hold(&config), [false, false]);
+        });
+        // The key sets one model; an omitted key takes the default, never
+        // another model's value.
+        with_model_list(
+            &list(serde_json::json!({"affinity_hold_at_limit": true})),
+            &[],
+            || assert_eq!(hold(&Config::from_env().unwrap()), [true, false]),
+        );
+        // The variable is the default of every model that omits the key.
+        with_model_list(
+            &list(serde_json::json!({})),
+            &[("VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT", "1")],
+            || assert_eq!(hold(&Config::from_env().unwrap()), [true, true]),
+        );
+        with_model_list(
+            &list(serde_json::json!({"affinity_hold_at_limit": false})),
+            &[("VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT", "1")],
+            || assert_eq!(hold(&Config::from_env().unwrap()), [false, true]),
+        );
+        // A value that is not a boolean fails startup.
+        for value in [serde_json::json!("true"), serde_json::json!(1)] {
+            let error = with_model_list(
+                &list(serde_json::json!({"affinity_hold_at_limit": value})),
+                &[],
+                || {
+                    Config::from_env()
+                        .expect_err("the list must be refused")
+                        .to_string()
+                },
+            );
+            assert!(
+                error.contains("not a valid model list") && error.contains("expected a boolean"),
+                "{value}: {error}"
+            );
+        }
+
+        // One model from env.
+        for (raw, expected) in [("1", true), ("true", true), ("0", false), ("", false)] {
+            with_clean_env(
+                &[("MODEL_NAME", "example/alpha"), ("TOKEN", "t")],
+                &[
+                    ("NON_TEE_DEPLOYMENT", "1"),
+                    ("VLLM_BACKEND_URLS", "https://alpha-b1.example"),
+                    ("VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT", raw),
+                ],
+                || {
+                    let config = Config::from_env().unwrap();
+                    assert_eq!(config.affinity_hold_at_limit, expected, "{raw:?}");
+                    assert_eq!(config.single_model().affinity_hold_at_limit, expected);
+                },
+            );
+        }
+    }
+}

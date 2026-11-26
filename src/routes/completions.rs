@@ -1,0 +1,229 @@
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::response::Response;
+use axum::Extension;
+
+use crate::auth::RequireAuth;
+use crate::backend_affinity::{parse_replica_hint, ReplicaHint};
+use crate::encryption::{self, Endpoint};
+use crate::error::AppError;
+use crate::model_metrics::ModelRequest;
+use crate::proxy::{self, make_usage_reporter_for, ProxyOpts, ResponseShape, UsageType};
+use crate::routes::chat::{read_body_with_limit, resolve_request_hash_for_signing};
+use crate::routes::completion_placement::place_completion;
+use crate::routes::ROUTE_COMPLETIONS;
+use crate::{AppState, RequestStart, TracingIds};
+
+/// POST /v1/completions
+pub async fn completions(
+    State(state): State<AppState>,
+    auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
+    request_start: Option<Extension<RequestStart>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
+    // See the chat route: list mode counts the response under its model.
+    let mut counted_as = None;
+    let result = serve(
+        state,
+        auth,
+        tracing_ids,
+        request_start,
+        headers,
+        body,
+        &mut counted_as,
+    )
+    .await;
+    crate::model_metrics::count_response(counted_as, result)
+}
+
+async fn serve(
+    state: AppState,
+    auth: RequireAuth,
+    tracing_ids: TracingIds,
+    request_start: Option<Extension<RequestStart>>,
+    headers: HeaderMap,
+    body: Body,
+    counted_as: &mut Option<ModelRequest>,
+) -> Result<Response, AppError> {
+    let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
+
+    let mut request_json = proxy::parse_json_object(&request_body)?;
+    // On the direct `sk-` path the backend assigns its own id. Trusted
+    // gateway traffic is unaffected.
+    if auth.cloud_api_key.is_some() {
+        proxy::strip_client_request_ids(&mut request_json);
+    }
+
+    // See the chat route: the process's one model, or the list entry the
+    // body's `model` names.
+    let model = crate::model_list::model_for(&state, &request_json)?;
+    *counted_as = ModelRequest::of(model.label, ROUTE_COMPLETIONS);
+
+    // Engine `priority`: the proxy decides it (trusted callers may set it via
+    // header; any client value is discarded).
+    crate::priority::apply_priority(
+        &mut request_json,
+        &headers,
+        auth.cloud_api_key.is_none(),
+        state.config.priority_lower_first,
+    );
+    // Engine prompt-cache namespace; see the chat route.
+    crate::cache_salt::apply(&mut request_json, &auth)?;
+
+    // Extract encryption context from headers
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
+
+    let original_request_hash = Some(resolve_request_hash_for_signing(
+        &headers,
+        &request_body,
+        auth.cloud_api_key.is_none(),
+    ));
+
+    // Decrypt request fields if encryption is active
+    if let Some(ref ctx) = enc_ctx {
+        encryption::decrypt_request_fields(
+            &mut request_json,
+            Endpoint::Completions,
+            ctx,
+            &state.signing,
+        )?;
+    }
+    // See the chat route: the check runs on the body that is forwarded.
+    crate::model_list::guard_request_body(
+        &request_json,
+        if auth.cloud_api_key.is_some() {
+            Some(model.id)
+        } else {
+            crate::model_list::checked_model(&state, model.id)
+        },
+    )?;
+    crate::model_list::apply_backend_lora(&state, &mut request_json);
+    // The field rules and media inlining (`forward_body.rs`); the body is
+    // re-serialized below in any case.
+    crate::forward_body::prepare(
+        &state.config,
+        crate::forward_body::Rules::Completion,
+        &mut request_json,
+    )
+    .await?;
+    // Size bonus on the engine `priority`, from the decrypted prompt; see the
+    // chat route.
+    if let Some(tiers) = &state.config.priority_size_tiers {
+        crate::priority::apply_size_bonus(
+            &mut request_json,
+            tiers,
+            crate::priority::BodyKind::Completion,
+            state.config.priority_lower_first,
+        );
+    }
+
+    let is_stream = request_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // For cloud API key requests with streaming, force include_usage AND
+    // continuous_usage_stats so the backend sends running cumulative token counts
+    // on every chunk, making an interrupted stream billable (nearai/infra#98).
+    // include_usage alone only emits usage in the final chunk, which a stream
+    // interrupted before [DONE] never reaches.
+    if auth.cloud_api_key.is_some() && is_stream {
+        let stream_opts = request_json
+            .get("stream_options")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut stream_opts = stream_opts;
+        stream_opts.insert("include_usage".into(), true.into());
+        stream_opts.insert("continuous_usage_stats".into(), true.into());
+        request_json["stream_options"] = serde_json::Value::Object(stream_opts);
+    }
+
+    let modified_body =
+        serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
+
+    // Build encryption transforms if active
+    let (response_transform, chunk_transform) = if let Some(ctx) = enc_ctx {
+        let signing = state.signing.clone();
+        (
+            Some(encryption::make_response_transform(
+                Endpoint::Completions,
+                ctx.clone(),
+                signing.clone(),
+            )),
+            Some(encryption::make_chunk_transform(
+                Endpoint::Completions,
+                ctx,
+                signing,
+            )),
+        )
+    } else {
+        (None, None)
+    };
+
+    // Long-context tier and lane admission (gateway mode), see the chat
+    // route. Token ids in `prompt` are counted exactly; text is estimated.
+    // The estimate is walked at most once and also sizes the first-token
+    // deadline, which only streaming requests get.
+    let estimate = (model.long_context_above_tokens > 0
+        || (is_stream && state.config.first_token_deadline_ms > 0))
+        .then(|| crate::context_tier::completion_estimate(&request_json));
+    let tier = crate::context_tier::decide(
+        model.backend_pool,
+        model.long_context_above_tokens,
+        model.backend_tier_strict,
+        || estimate.unwrap_or_else(|| crate::context_tier::completion_estimate(&request_json)),
+    );
+    // Placement hint from cloud-api, same trust predicate as chat completions
+    // and `X-NearAI-Priority`: honoured only for a caller authenticated with
+    // the proxy's own config token, not an `sk-` API key.
+    let hint = if auth.cloud_api_key.is_none() {
+        parse_replica_hint(&headers)
+    } else {
+        ReplicaHint::Absent
+    };
+    let placed = place_completion(&state, &model, ROUTE_COMPLETIONS, tier, None, hint)?;
+
+    let opts = ProxyOpts {
+        signing: state.signing.clone(),
+        cache: state.cache.clone(),
+        id_prefix: "cmpl".to_string(),
+        model_name: model.id.to_string(),
+        model_label: model.label,
+        model_request: *counted_as,
+        usage_reporter: make_usage_reporter_for(&auth, &state, &model),
+        usage_type: UsageType::ChatCompletion,
+        request_hash: original_request_hash,
+        response_transform,
+        chunk_transform,
+        backend_guard: Some(placed.backend_guard),
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: state.config.sse_keepalive_secs,
+        map_queue_full_to_429: state.config.map_queue_full_to_429,
+        stream_error_peek_ms: state.config.stream_error_peek_ms,
+        stream_commit_ms: state.config.stream_commit_ms,
+        response_shape: ResponseShape::TextCompletion,
+        tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank: None,
+        admission: placed.admission,
+        connect_failover: placed.connect_failover,
+        // See the chat route: the clock started when the request arrived.
+        first_token_deadline: proxy::first_token_deadline(
+            &state,
+            &model,
+            RequestStart::or_now(request_start),
+            estimate,
+            is_stream,
+        ),
+    };
+
+    if is_stream {
+        proxy::proxy_streaming_request(model.backend_client, &placed.url, modified_body, opts).await
+    } else {
+        proxy::proxy_json_request(model.backend_client, &placed.url, modified_body, opts).await
+    }
+}

@@ -1,0 +1,167 @@
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+mod common;
+#[path = "common/response_request_id.rs"]
+mod response_request_id;
+#[path = "common/valid_request_id.rs"]
+mod valid_request_id;
+
+use common::*;
+use response_request_id::*;
+use valid_request_id::*;
+
+#[tokio::test]
+async fn direct_privacy_classify_observable_request_id_contract() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-authenticated",
+            "workspace_id": "ws-authenticated",
+            "api_key_id": "key-authenticated"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/privacy/classify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"index": 0, "label": "synthetic", "usage": {"input_tokens": 3}}]
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app(
+        &backend.uri(),
+        TestAppOptions {
+            cloud_api_url: Some(cloud_api.uri()),
+            dstack_socket_path: None,
+            ..Default::default()
+        },
+    );
+    let valid = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/privacy/classify?case=valid")
+                .header("authorization", "Bearer sk-test-public-key-1234567890123")
+                .header("content-type", "application/json")
+                .header("x-request-id", VALID_REQUEST_ID)
+                .header("x-org-id", "org-spoofed")
+                .header("x-workspace-id", "ws-spoofed")
+                .body(Body::from(r#"{"model":"test-model","input":"synthetic"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), StatusCode::OK);
+    assert!(valid.headers().get("inference-id").is_some());
+    assert_eq!(
+        valid.headers().get("x-request-id").unwrap(),
+        VALID_REQUEST_ID
+    );
+
+    let invalid = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/privacy/classify?case=invalid")
+                .header("authorization", "Bearer sk-test-public-key-2234567890123")
+                .header("content-type", "application/json")
+                .header("x-request-id", "not-a-uuid")
+                .header("x-org-id", "org-spoofed")
+                .header("x-workspace-id", "ws-spoofed")
+                .body(Body::from(r#"{"model":"test-model","input":"synthetic"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::OK);
+    assert!(invalid.headers().get("inference-id").is_some());
+    let replacement_id = request_id_from_response(&invalid);
+    assert_uuid(&replacement_id);
+    assert_ne!(replacement_id, "not-a-uuid");
+
+    let received = backend
+        .received_requests()
+        .await
+        .expect("backend records requests");
+    assert_eq!(
+        received.len(),
+        2,
+        "expected valid and invalid classify requests"
+    );
+
+    let valid_upstream = received
+        .iter()
+        .find(|request| request.url.query() == Some("case=valid"))
+        .expect("valid classify request reached backend");
+    assert_eq!(valid_upstream.url.path(), "/v1/privacy/classify");
+    // The direct path forwards a server id to the backend, not the inbound one.
+    let valid_forwarded = valid_upstream
+        .headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("valid classify request has an x-request-id");
+    assert_uuid(valid_forwarded);
+    assert_ne!(valid_forwarded, VALID_REQUEST_ID);
+    assert!(!valid_upstream.headers.contains_key("x-org-id"));
+    assert!(!valid_upstream.headers.contains_key("x-workspace-id"));
+
+    let invalid_upstream = received
+        .iter()
+        .find(|request| request.url.query() == Some("case=invalid"))
+        .expect("invalid classify request reached backend");
+    assert_eq!(invalid_upstream.url.path(), "/v1/privacy/classify");
+    let invalid_forwarded = invalid_upstream
+        .headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("invalid classify request has an x-request-id");
+    assert_uuid(invalid_forwarded);
+    assert_ne!(invalid_forwarded, replacement_id);
+    assert!(!invalid_upstream.headers.contains_key("x-org-id"));
+    assert!(!invalid_upstream.headers.contains_key("x-workspace-id"));
+
+    let auth_checks: Vec<_> = cloud_api
+        .received_requests()
+        .await
+        .expect("cloud api records auth checks")
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/check_api_key")
+        .collect();
+    // Two distinct direct keys each receive an auth check.
+    assert_eq!(auth_checks.len(), 2, "expected one auth check per key");
+    assert_eq!(
+        auth_checks[0]
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(VALID_REQUEST_ID)
+    );
+    assert_eq!(
+        auth_checks[1]
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(replacement_id.as_str())
+    );
+
+    eprintln!(
+        "manual-qa: POST /v1/privacy/classify forwarded status=200 valid_x_request_id={} invalid_replacement_x_request_id={} upstream_valid_query={} auth_checks_correlated=true tenant_headers_present=false",
+        VALID_REQUEST_ID,
+        replacement_id,
+        valid_upstream.url.query().unwrap_or("<missing>")
+    );
+}

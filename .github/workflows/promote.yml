@@ -1,0 +1,168 @@
+name: Promote Staging to Production
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "promote" to confirm promoting :staging to :prod and :latest'
+        required: true
+
+env:
+  REGISTRY: docker.io
+  IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/vllm-proxy-rs
+
+concurrency:
+  group: prod-image-mutation
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote staging -> prod
+    permissions:
+      contents: write
+      id-token: write
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "promote" ]; then
+            echo "Confirmation input must be exactly 'promote'" >&2
+            exit 1
+          fi
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532  # v4.1.3
+
+      - name: Resolve staging digest and source SHA
+        id: resolve
+        env:
+          VAR_DOCKER_REGISTRY_USER: ${{ vars.DOCKER_REGISTRY_USER }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_REPOSITORY}"
+          DIGEST=$(skopeo inspect "docker://${IMAGE}:staging" | jq -r '.Digest')
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "::error::Failed to resolve ${IMAGE}:staging"
+            exit 1
+          fi
+
+          SHORT_SHA="unknown"
+          PAGE_URL="https://hub.docker.com/v2/namespaces/${VAR_DOCKER_REGISTRY_USER}/repositories/vllm-proxy-rs/tags?page_size=100"
+          PAGE_COUNT=0
+          while [ -n "$PAGE_URL" ] && [ "$PAGE_URL" != "null" ] && [ "$PAGE_COUNT" -lt 50 ]; do
+            RESP=$(curl -fsS --max-time 30 --retry 2 --retry-delay 2 "$PAGE_URL")
+            MATCH=$(echo "$RESP" | jq -r --arg d "$DIGEST" '.results[] | select(.digest==$d) | select(.name | test("^staging-[0-9]{8}-[0-9a-f]{7}$")) | .name' | head -n1)
+            if [ -n "$MATCH" ]; then
+              SHORT_SHA=$(echo "$MATCH" | sed -E 's/^staging-[0-9]{8}-//')
+              break
+            fi
+            PAGE_URL=$(echo "$RESP" | jq -r '.next')
+            PAGE_COUNT=$((PAGE_COUNT + 1))
+          done
+          if [ "$SHORT_SHA" = "unknown" ]; then
+            SHORT_SHA=$(echo "$DIGEST" | sed 's/^sha256://' | cut -c1-7)
+            echo "No matching staging-* tag found; using digest-derived suffix ${SHORT_SHA}"
+          fi
+
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "source_short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify :staging was built and signed by build.yml on main
+        env:
+          STEP_RESOLVE_IMAGE: ${{ steps.resolve.outputs.image }}
+          STEP_RESOLVE_DIGEST: ${{ steps.resolve.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/nearai/inference-proxy/\.github/workflows/build\.yml@refs/heads/main$' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            --certificate-github-workflow-repository 'nearai/inference-proxy' \
+            --certificate-github-workflow-ref 'refs/heads/main' \
+            "${STEP_RESOLVE_IMAGE}@${STEP_RESOLVE_DIGEST}"
+
+      - name: Re-tag staging digest to prod aliases
+        env:
+          STEP_RESOLVE_IMAGE: ${{ steps.resolve.outputs.image }}
+          STEP_RESOLVE_DIGEST: ${{ steps.resolve.outputs.digest }}
+          STEP_RESOLVE_SOURCE_SHORT_SHA: ${{ steps.resolve.outputs.source_short_sha }}
+        run: |
+          set -euo pipefail
+          IMAGE="${STEP_RESOLVE_IMAGE}"
+          DIGEST="${STEP_RESOLVE_DIGEST}"
+          STAMP=$(date -u +%Y%m%d)
+          PROD_STAMPED_TAG="prod-${STAMP}-${STEP_RESOLVE_SOURCE_SHORT_SHA}"
+          PROD_STAMPED_REF="${IMAGE}:${PROD_STAMPED_TAG}"
+
+          skopeo copy "docker://${IMAGE}@${DIGEST}" "docker://${IMAGE}:prod"
+          skopeo copy "docker://${IMAGE}@${DIGEST}" "docker://${PROD_STAMPED_REF}"
+          skopeo copy "docker://${IMAGE}@${DIGEST}" "docker://${IMAGE}:latest"
+
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+          echo "PROD_STAMPED_TAG=${PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
+          echo "PROD_STAMPED_REF=${PROD_STAMPED_REF}" >> "$GITHUB_ENV"
+
+      - name: Confirm prod tags resolve to the promoted digest
+        run: |
+          set -euo pipefail
+          for tag in prod "${PROD_STAMPED_TAG}" latest; do
+            RESOLVED_DIGEST=$(skopeo inspect "docker://${IMAGE}:${tag}" | jq -r '.Digest')
+            if [ "${RESOLVED_DIGEST}" != "${IMAGE_DIGEST}" ]; then
+              echo "::error::${tag} resolved to ${RESOLVED_DIGEST}, expected ${IMAGE_DIGEST}"
+              exit 1
+            fi
+          done
+
+      - name: Create GitHub release
+        env:
+          STEP_RESOLVE_SOURCE_SHORT_SHA: ${{ steps.resolve.outputs.source_short_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          NOTES=$(cat <<EOF
+          ## Production Promotion
+
+          - **Image**: \`${IMAGE}:prod\`
+          - **Stamped image**: \`${PROD_STAMPED_REF}\`
+          - **Compatibility alias**: \`${IMAGE}:latest\`
+          - **Digest**: \`${IMAGE_DIGEST}\`
+          - **Source short-sha**: \`${STEP_RESOLVE_SOURCE_SHORT_SHA}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}
+          EOF
+          )
+          if gh release view "$PROD_STAMPED_TAG" >/dev/null 2>&1; then
+            gh release edit "$PROD_STAMPED_TAG" --title "Production Release ${PROD_STAMPED_TAG}" --notes "$NOTES"
+          else
+            gh release create "$PROD_STAMPED_TAG" --title "Production Release ${PROD_STAMPED_TAG}" --notes "$NOTES" --latest
+          fi
+
+      - name: Generate summary
+        run: |
+          {
+            echo "## vllm-proxy-rs promotion"
+            echo ""
+            echo "- prod: \`${IMAGE}:prod\`"
+            echo "- stamped tag: \`${PROD_STAMPED_REF}\`"
+            echo "- latest alias: \`${IMAGE}:latest\`"
+            echo "- digest: \`${IMAGE_DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

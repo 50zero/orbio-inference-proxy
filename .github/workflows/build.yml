@@ -1,0 +1,124 @@
+name: Build & Deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: docker.io
+  IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/vllm-proxy-rs
+
+jobs:
+  reproducible-docker-image:
+    name: Reproducible Docker Image
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Extract image tag from GitHub ref (branch or tag)
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
+            TAG=${GITHUB_REF_NAME#v}
+            echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} tag"
+          elif [[ "${GITHUB_REF_TYPE}" == 'branch' ]]; then
+            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'main' ]]; then echo 'staging'; else echo 'dev'; fi)
+            echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} branch"
+          else
+            echo "Unsupported ref type: ${GITHUB_REF_TYPE}" >&2
+            exit 1
+          fi
+
+          if [ -z "${TAG}" ]; then
+            echo "Unable to parse image tag from ${GITHUB_REF_TYPE}: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "IMAGE_REFERENCE=${REGISTRY}/${IMAGE_REPOSITORY}:${TAG}" >> "$GITHUB_ENV"
+          if [[ "${GITHUB_REF_TYPE}" == 'branch' && "${GITHUB_REF_NAME}" == 'main' ]]; then
+            echo "ALSO_TAG_STAGING_STAMP=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Build and push reproducible image
+        env:
+          # Build with the nv-attestation-sdk Cargo feature so the
+          # runtime image ships libnvat.so. Independent of whether the
+          # SDK code path is actually used at runtime — that's still
+          # gated by the USE_NV_ATTESTATION_SDK env var on the CVM.
+          # Lets a single image flip between Python and SDK backends
+          # via env-var change, no rebuild.
+          ENABLE_NV_ATTESTATION_SDK: "1"
+        run: |
+          ./build-image.sh --push "${IMAGE_REFERENCE}"
+
+      # Read the digest from the archive's index.json, the way external
+      # verifiers do. build-image.sh guarantees a single manifest, so this is
+      # the value `skopeo inspect oci-archive:` reports, without unpacking the
+      # whole archive into a temporary directory.
+      - name: Get image digest
+        run: |
+          DIGEST=$(tar -xOf oci.tar index.json | jq -r '.manifests[0].digest')
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Failed to get image digest from OCI archive (got '${DIGEST}')" >&2
+            exit 1
+          fi
+          echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          push-to-registry: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532  # v4.1.3
+
+      - name: Sign image with cosign (keyless)
+        run: |
+          cosign sign --yes "${REGISTRY}/${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+
+      - name: Push immutable staging tag
+        if: env.ALSO_TAG_STAGING_STAMP == 'true'
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          STAMP=$(date -u +%Y%m%d)
+          STAGING_STAMPED_REF="${REGISTRY}/${IMAGE_REPOSITORY}:staging-${STAMP}-${SHORT_SHA}"
+          skopeo copy oci-archive:./oci.tar "docker://${STAGING_STAMPED_REF}"
+          echo "STAGING_STAMPED_REFERENCE=${STAGING_STAMPED_REF}" >> "$GITHUB_ENV"
+
+      - name: Generate build summary
+        run: |
+          {
+            echo "## vllm-proxy-rs docker image"
+            echo ""
+            echo "- tag: \`${IMAGE_REFERENCE}\`"
+            echo "- digest: \`${IMAGE_DIGEST}\`"
+            echo "- sigstore: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}"
+            if [[ "${ALSO_TAG_STAGING_STAMP}" == "true" ]]; then
+              echo "- staging stamped: \`${STAGING_STAMPED_REFERENCE}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
